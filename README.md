@@ -374,7 +374,8 @@ Text-typed files (`.md`, `.json`, source code, …) and images keep their previo
 When the ACP agent advertises HTTP MCP support, `wechat-acp` injects a local
 `attach_file` tool into the session. The agent can call it with a file it
 created under the configured working directory, and the bridge sends that
-snapshot back as a WeChat file message.
+snapshot back as a WeChat file message. Files whose type is a supported image
+are delivered as native WeChat images instead of file cards.
 
 The MCP server listens only on a random `127.0.0.1` port, requires a
 process-local bearer token, rejects browser-origin requests, and only reads
