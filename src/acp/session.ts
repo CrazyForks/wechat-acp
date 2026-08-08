@@ -73,6 +73,7 @@ export interface SessionManagerOpts {
   agentPreset?: string;
   idleTimeoutMs: number;
   maxConcurrentUsers: number;
+  turnEndMessage?: string;
   showThoughts: boolean;
   showDiffs?: boolean;
   showImages?: boolean;
@@ -484,6 +485,21 @@ export class SessionManager {
               pending.contextToken,
               emptyTurnNotice(result.stopReason),
             );
+          }
+
+          if (this.opts.turnEndMessage?.trim()) {
+            try {
+              await this.opts.onReply(
+                session.userId,
+                pending.contextToken,
+                this.opts.turnEndMessage,
+              );
+            } catch (err) {
+              this.opts.log(
+                `[${session.userId}] Failed to send turn end message: ${String(err)}`,
+              );
+              trackException(err, "reply.turn_end", hashUserId(session.userId));
+            }
           }
         } catch (err) {
           completionError = err;

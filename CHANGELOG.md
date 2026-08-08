@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add an opt-in standalone turn completion message so WeChat users can tell when a streamed or long-running ACP prompt has actually ended. Configure `session.turnEndMessage` or pass `--turn-end-message <text>`; the bridge sends the text after `prompt()` resolves and the turn's queued output has drained. Fixes #66.
+
 ## 0.10.0
 
 - Deliver agent-generated files to WeChat as native file messages. When the ACP agent advertises HTTP MCP support, the bridge injects a loopback `attach_file` tool into the session, so an agent can hand back a file it created under the working directory and the bridge sends that one-shot in-memory snapshot through the WeChat CDN. Standard ACP `resource_link` output, embedded blob resources, Codex completed tool-call links, and Copilot CLI's `rawOutput.contents[type=resource_link]` shape all resolve to the same delivery path. The MCP server listens only on a random `127.0.0.1` port, requires a process-local bearer token, rejects browser-origin requests, and reads only regular files whose resolved path stays inside the agent working directory; files are capped at 25 MiB with bounded reads, consumed once, and their names sanitized of Unicode control characters, with per-agent MCP leases cleaned up on teardown. Delivery reuses the existing per-user reply queue with upload-once retry and a stable `client_id`. Enabled by default; `--hide-resources` / `agent.showResources: false` disables both the tool injection and outbound file delivery. Adds one telemetry event: `reply.file.sent`. See the README's "Receiving agent-generated files" section.
