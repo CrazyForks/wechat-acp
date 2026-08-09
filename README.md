@@ -250,7 +250,7 @@ Two alias styles are supported:
 
 Notes:
 
-- Keys must be a known bridge command (`/acp-config`, `/acp-cancel`, `/acp-prompt-start`, or `/acp-prompt-done`).
+- Keys must be a known bridge command (`/acp-config`, `/acp-cancel`, `/acp-more`, `/acp-prompt-start`, or `/acp-prompt-done`).
 - An alias may not collide with a built-in command name or be mapped to
   more than one command. Invalid configs are rejected at startup.
 
@@ -262,6 +262,30 @@ Notes:
 - Replies are formatted for WeChat before sending.
 - Typing indicators are sent when supported by the WeChat API.
 - Sessions are cleaned up after inactivity (set `idleTimeoutMs` to `0` to disable idle cleanup).
+
+## Fetching text that iLink rejected
+
+WeChat iLink limits how many outbound messages can use one inbound context
+token. If a long agent reply reaches that limit and iLink reports send failures,
+the bridge keeps the failed text segments for 10 minutes. Send this command in
+a new WeChat message to deliver them with its fresh context token:
+
+```text
+/acp-more
+```
+
+The command is handled by the bridge and never becomes an ACP prompt. It sends
+pending segments in order and stops at the first segment that still fails after
+retries. That segment and the remaining segments stay pending for the next
+`/acp-more`. A new normal agent prompt clears older pending output. Storage is
+in memory, limited to 50 text segments per active user, and does not include
+images, audio, or files.
+
+Aliases work through `commandAliases`. Bare aliases must match the whole
+message, so they are intercepted before the normal ACP enqueue path.
+
+This mitigation can only retain failures reported by iLink. If iLink returns
+success but silently drops a message, the bridge cannot detect or replay it.
 
 ## WeChat ACP config command
 
