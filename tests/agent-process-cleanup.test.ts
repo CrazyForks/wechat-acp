@@ -52,7 +52,7 @@ test("Windows cleanup surfaces process-tree termination failures", async () => {
   );
 });
 
-test("Windows cleanup accepts taskkill losing a race with wrapper exit", async () => {
+test("Windows cleanup retains taskkill failure if the wrapper exits before retry", async () => {
   const state = { exitCode: null as number | null };
   const proc = new EventEmitter() as ChildProcess;
   Object.defineProperties(proc, {
@@ -60,14 +60,68 @@ test("Windows cleanup accepts taskkill losing a race with wrapper exit", async (
     exitCode: { get: () => state.exitCode },
     signalCode: { value: null },
   });
+  let attempts = 0;
 
+  await assert.rejects(
+    killAgentAndWait(proc, 1234, {
+      platform: "win32",
+      killWindowsProcessTree: async () => {
+        attempts++;
+        throw new Error("tree termination failed");
+      },
+    }),
+    /tree termination failed/,
+  );
+  state.exitCode = 0;
+  await assert.rejects(
+    killAgentAndWait(proc, 1234, {
+      platform: "win32",
+      killWindowsProcessTree: async () => {
+        attempts++;
+      },
+    }),
+    /tree termination failed/,
+  );
+  assert.equal(attempts, 1);
+});
+
+test("Windows cleanup retries taskkill while the wrapper is running", async () => {
+  const proc = makeRunningProcess(4242, []);
+  let attempts = 0;
+  const cleanup = async () => {
+    attempts++;
+    if (attempts === 1) {
+      throw new Error("tree termination failed");
+    }
+  };
+
+  await assert.rejects(
+    killAgentAndWait(proc, 1234, {
+      platform: "win32",
+      killWindowsProcessTree: cleanup,
+    }),
+    /tree termination failed/,
+  );
   await killAgentAndWait(proc, 1234, {
     platform: "win32",
-    killWindowsProcessTree: async () => {
-      state.exitCode = 0;
-      throw new Error("process not found");
-    },
+    killWindowsProcessTree: cleanup,
   });
+  assert.equal(attempts, 2);
+});
+
+test("Windows cleanup rejects an exited wrapper without verified tree cleanup", async () => {
+  const state = { exitCode: 0 as number | null };
+  const proc = new EventEmitter() as ChildProcess;
+  Object.defineProperties(proc, {
+    pid: { value: 4242 },
+    exitCode: { get: () => state.exitCode },
+    signalCode: { value: null },
+  });
+
+  await assert.rejects(
+    killAgentAndWait(proc, 1234, { platform: "win32" }),
+    /wrapper exited before its Windows process tree could be stopped/,
+  );
 });
 
 test("POSIX cleanup targets the process group after wrapper exit", async () => {

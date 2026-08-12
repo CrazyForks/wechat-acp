@@ -688,6 +688,75 @@ test("idle cleanup retains failures for a later acp-new retry", async () => {
   assert.equal(closeCalls, 2);
 });
 
+test("natural wrapper exit retains process-group cleanup for retry", async () => {
+  const process = new EventEmitter() as ChildProcess;
+  Object.defineProperties(process, {
+    pid: { value: 4242 },
+    exitCode: { value: 0 },
+    signalCode: { value: null },
+  });
+  let processCleanupCalls = 0;
+  const manager = makeManager({
+    killAgentProcess: async (candidate) => {
+      assert.equal(candidate, process);
+      processCleanupCalls++;
+      if (processCleanupCalls === 1) {
+        throw new Error("process group cleanup failed");
+      }
+    },
+  });
+  const internal = manager as unknown as {
+    sessions: Map<string, UserSession>;
+    handleAgentExit(userId: string, process: ChildProcess): void;
+  };
+  internal.sessions.set("target", makeSession("target", { process }));
+
+  internal.handleAgentExit("target", process);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(manager.getSession("target"), undefined);
+  assert.equal(processCleanupCalls, 1);
+
+  await manager.resetSession("target");
+  assert.equal(processCleanupCalls, 2);
+});
+
+test("session creation rejects a process that already exited", async () => {
+  const process = new EventEmitter() as ChildProcess;
+  Object.defineProperties(process, {
+    pid: { value: 4242 },
+    exitCode: { value: 0 },
+    signalCode: { value: null },
+  });
+  let processCleanupCalls = 0;
+  const manager = makeManager({
+    killAgentProcess: async (candidate) => {
+      assert.equal(candidate, process);
+      processCleanupCalls++;
+    },
+  });
+  const internal = manager as unknown as {
+    createSession(
+      userId: string,
+      contextToken: string,
+      signal: AbortSignal,
+    ): Promise<UserSession>;
+    getOrCreateSession(
+      userId: string,
+      contextToken: string,
+    ): Promise<UserSession>;
+  };
+  internal.createSession = async () =>
+    makeSession("target", { process });
+
+  await assert.rejects(
+    internal.getOrCreateSession("target", "context"),
+    /Agent process exited/,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(manager.getSession("target"), undefined);
+  assert.equal(processCleanupCalls, 1);
+});
+
 test("capacity eviction waits for old resources to close", async () => {
   let releaseLease!: () => void;
   const leaseClosed = new Promise<void>((resolve) => {

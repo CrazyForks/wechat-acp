@@ -34,6 +34,11 @@ export class AgentProcessCleanupError extends AggregateError {
   }
 }
 
+const uncertainWindowsProcessTrees = new WeakMap<
+  ChildProcess,
+  { error: unknown }
+>();
+
 export async function spawnAgent(params: {
   command: string;
   args: string[];
@@ -263,7 +268,17 @@ export async function killAgentAndWait(
 ): Promise<void> {
   const platform = options.platform ?? process.platform;
   if (platform === "win32") {
-    if (proc.exitCode !== null || proc.signalCode !== null) return;
+    const retainedFailure = uncertainWindowsProcessTrees.get(proc);
+    const wrapperExited =
+      proc.exitCode !== null || proc.signalCode !== null;
+    if (retainedFailure && wrapperExited) throw retainedFailure.error;
+    if (wrapperExited) {
+      const error = new Error(
+        "Agent wrapper exited before its Windows process tree could be stopped",
+      );
+      uncertainWindowsProcessTrees.set(proc, { error });
+      throw error;
+    }
     if (proc.pid === undefined) {
       throw new Error("Cannot stop agent process tree without a process ID");
     }
@@ -272,10 +287,12 @@ export async function killAgentAndWait(
         options.killWindowsProcessTree ?? killWindowsProcessTree
       )(proc.pid, timeoutMs);
     } catch (err) {
-      if (proc.exitCode === null && proc.signalCode === null) {
-        throw err;
-      }
+      // If the wrapper exits before a later retry, its PID can be reused and
+      // Windows cannot prove that every former descendant is gone.
+      uncertainWindowsProcessTrees.set(proc, { error: err });
+      throw err;
     }
+    uncertainWindowsProcessTrees.delete(proc);
     return;
   }
 

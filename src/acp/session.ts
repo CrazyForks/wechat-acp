@@ -567,6 +567,14 @@ export class SessionManager {
         return winner;
       }
       this.sessions.set(userId, created);
+      if (
+        created.agentInfo.process.exitCode !== null ||
+        created.agentInfo.process.signalCode !== null
+      ) {
+        this.handleAgentExit(userId, created.agentInfo.process);
+        throw created.closedError ??
+          new Error("Agent process exited while creating the session");
+      }
       return created;
     });
     entry = {
@@ -635,13 +643,14 @@ export class SessionManager {
     session: UserSession,
     includeProcess: boolean,
   ): void {
-    const processRunning =
-      session.agentInfo.process.exitCode === null &&
-      session.agentInfo.process.signalCode === null;
-    if (!session.mcpLease && (!includeProcess || !processRunning)) return;
+    const agentProcess = session.agentInfo.process;
+    const processCanBeCleaned =
+      (agentProcess.exitCode === null && agentProcess.signalCode === null) ||
+      agentProcess.pid !== undefined;
+    if (!session.mcpLease && (!includeProcess || !processCanBeCleaned)) return;
     const state = this.getOrCreateCleanupState(session.userId);
-    if (includeProcess && processRunning) {
-      state.processes.add(session.agentInfo.process);
+    if (includeProcess && processCanBeCleaned) {
+      state.processes.add(agentProcess);
     }
     if (session.mcpLease) {
       state.mcpLeases.add(session.mcpLease);
@@ -843,17 +852,7 @@ export class SessionManager {
 
     // If agent process exits, clean up the session
     agentInfo.process.on("exit", () => {
-      const s = this.sessions.get(userId);
-      if (s && s.agentInfo.process === agentInfo.process) {
-        this.opts.log(`Agent process for ${userId} exited, removing session`);
-        s.closedError = new Error(
-          "Agent process exited before queued message was processed",
-        );
-        this.rejectQueuedCompletions(s, s.closedError);
-        this.registerSessionCleanup(s, false);
-        this.sessions.delete(userId);
-        this.retryCleanupInBackground(userId, "Agent exit");
-      }
+      this.handleAgentExit(userId, agentInfo.process);
     });
 
     return {
@@ -869,6 +868,20 @@ export class SessionManager {
       lastActivity: Date.now(),
       createdAt: Date.now(),
     };
+  }
+
+  private handleAgentExit(userId: string, agentProcess: ChildProcess): void {
+    const session = this.sessions.get(userId);
+    if (!session || session.agentInfo.process !== agentProcess) return;
+
+    this.opts.log(`Agent process for ${userId} exited, removing session`);
+    session.closedError = new Error(
+      "Agent process exited before queued message was processed",
+    );
+    this.rejectQueuedCompletions(session, session.closedError);
+    this.registerSessionCleanup(session, true);
+    this.sessions.delete(userId);
+    this.retryCleanupInBackground(userId, "Agent exit");
   }
 
   private async processQueue(session: UserSession): Promise<void> {

@@ -13,6 +13,7 @@ test("concurrent session creation reserves maxConcurrentUsers capacity", async (
     agentCwd: process.cwd(),
     idleTimeoutMs: 0,
     maxConcurrentUsers: 1,
+    killAgentProcess: async () => {},
     showThoughts: false,
     log: () => {},
     onReply: async () => {},
@@ -31,7 +32,11 @@ test("concurrent session creation reserves maxConcurrentUsers capacity", async (
       contextToken,
       client: {} as never,
       agentInfo: {
-        process: { killed: true } as never,
+        process: {
+          killed: false,
+          exitCode: null,
+          signalCode: null,
+        } as never,
         connection: {} as never,
         sessionId: userId,
         configOptions: [],
@@ -87,7 +92,11 @@ test("SessionManager.stop waits for every MCP lease before reporting failures", 
     contextToken: `${userId}-context`,
     client: {} as never,
     agentInfo: {
-      process: { killed: true } as never,
+      process: {
+        killed: false,
+        exitCode: null,
+        signalCode: null,
+      } as never,
       connection: {} as never,
       sessionId: userId,
       configOptions: [],
@@ -182,7 +191,11 @@ function makeTurnSession(opts: {
       hasProducedMessage: opts.producedMessage,
     } as never,
     agentInfo: {
-      process: { killed: false, exitCode: null } as never,
+      process: {
+        killed: false,
+        exitCode: null,
+        signalCode: null,
+      } as never,
       connection: {
         prompt: async () => {
           opts.events.push("prompt");
