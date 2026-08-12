@@ -10,6 +10,8 @@ class TestBridge extends WeChatAcpBridge {
   readonly enqueued: string[] = [];
   readonly buffered: Array<{ contextToken: string; prompt: ContentBlock[] }> = [];
   readonly sent: Array<{ contextToken: string; segment: string }> = [];
+  private readonly promptGenerations = new Map<string, number>();
+  bufferError: Error | undefined;
   sendBehavior: (
     contextToken: string,
     segment: string,
@@ -19,6 +21,8 @@ class TestBridge extends WeChatAcpBridge {
     _msg: WeixinMessage,
     _userId: string,
     contextToken: string,
+    _isCurrent: () => boolean = () => true,
+    _replyGeneration?: number,
   ): Promise<void> {
     this.enqueued.push(contextToken);
   }
@@ -27,8 +31,10 @@ class TestBridge extends WeChatAcpBridge {
     _userId: string,
     contextToken: string,
     prompt: ContentBlock[],
+    _replyGeneration?: number,
   ): Promise<void> {
     this.buffered.push({ contextToken, prompt });
+    if (this.bufferError) throw this.bufferError;
   }
 
   protected override async sendTextSegment(
@@ -42,10 +48,19 @@ class TestBridge extends WeChatAcpBridge {
 
   beginPrompt(contextToken: string): void {
     this.beginAgentPrompt("user", contextToken);
+    this.promptGenerations.set(
+      contextToken,
+      this.messageGenerationForUser("user"),
+    );
   }
 
   queueAgentReply(contextToken: string, text: string): Promise<void> {
-    return this.sendAgentReply("user", contextToken, text);
+    return this.sendAgentReply(
+      "user",
+      contextToken,
+      text,
+      this.promptGenerations.get(contextToken),
+    );
   }
 }
 
@@ -164,4 +179,21 @@ test("buffer flush uses the fresh acp-prompt-done context token", async () => {
   assert.deepEqual(bridge.buffered[0]!.prompt, [
     { type: "text", text: "buffered prompt" },
   ]);
+});
+
+test("a failed buffer flush does not create an unhandled rejection", async () => {
+  const bridge = makeBridge();
+  await bridge.handleMessage(
+    textMessage(BRIDGE_COMMANDS.promptStart, "context-start"),
+  );
+  await bridge.handleMessage(textMessage("buffered prompt", "context-content"));
+  bridge.bufferError = new Error("session reset");
+
+  await assert.rejects(
+    bridge.handleMessage(
+      textMessage(BRIDGE_COMMANDS.promptDone, "context-done"),
+    ),
+    /session reset/,
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
 });

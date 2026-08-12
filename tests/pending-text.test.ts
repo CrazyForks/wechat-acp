@@ -109,3 +109,16 @@ test("a newer prompt rejects late failures and drops the old fetch remainder", a
   assert.equal(registry.recordFailures("user", oldGeneration, ["late-old"]), false);
   assert.equal(registry.snapshot("user"), null);
 });
+
+test("clearing an unknown user does not evict another user's pending text", () => {
+  const registry = new PendingTextRegistry({
+    ttlMs: 60_000,
+    maxUsers: 1,
+    maxSegmentsPerUser: 10,
+  });
+  const generation = registry.supersede("first", "context-first");
+  registry.recordFailures("first", generation, ["pending"]);
+
+  assert.equal(registry.clearExisting("second"), false);
+  assert.deepEqual(registry.snapshot("first")?.segments, ["pending"]);
+});

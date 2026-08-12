@@ -20,6 +20,25 @@ export interface AgentProcessInfo {
   sessionOutcome: AgentSessionOutcome;
 }
 
+export class AgentProcessCleanupError extends AggregateError {
+  constructor(
+    startupError: unknown,
+    cleanupError: unknown,
+    readonly process: ChildProcess,
+  ) {
+    super(
+      [startupError, cleanupError],
+      "Agent startup failed and the process could not be stopped",
+    );
+    this.name = "AgentProcessCleanupError";
+  }
+}
+
+const uncertainWindowsProcessTrees = new WeakMap<
+  ChildProcess,
+  { error: unknown }
+>();
+
 export async function spawnAgent(params: {
   command: string;
   args: string[];
@@ -58,6 +77,7 @@ export async function spawnAgent(params: {
     cwd,
     env: { ...process.env, ...env },
     shell: useShell,
+    detached: !useShell,
     windowsHide: true,
   });
 
@@ -69,8 +89,6 @@ export async function spawnAgent(params: {
   proc.on("exit", (code, signal) => {
     log(`Agent process exited: code=${code} signal=${signal}`);
   });
-  const abortSpawn = () => killAgent(proc);
-  signal?.addEventListener("abort", abortSpawn, { once: true });
 
   try {
     if (!proc.stdin || !proc.stdout) {
@@ -178,10 +196,12 @@ export async function spawnAgent(params: {
       sessionOutcome,
     };
   } catch (err) {
-    killAgent(proc);
+    try {
+      await killAgentAndWait(proc);
+    } catch (cleanupErr) {
+      throw new AgentProcessCleanupError(err, cleanupErr, proc);
+    }
     throw err;
-  } finally {
-    signal?.removeEventListener("abort", abortSpawn);
   }
 
   function isResourceNotFound(err: unknown): boolean {
@@ -208,6 +228,24 @@ export async function spawnAgent(params: {
 }
 
 export function killAgent(proc: ChildProcess): void {
+  if (process.platform !== "win32" && proc.pid !== undefined) {
+    const groupPid = proc.pid;
+    try {
+      if (!signalPosixProcessGroup(groupPid, "SIGTERM")) return;
+      setTimeout(() => {
+        try {
+          if (isPosixProcessGroupRunning(groupPid)) {
+            signalPosixProcessGroup(groupPid, "SIGKILL");
+          }
+        } catch {
+          proc.kill("SIGKILL");
+        }
+      }, 5_000).unref();
+      return;
+    } catch {
+      // Fall back to the direct child when the process is not a group leader.
+    }
+  }
   if (proc.exitCode === null && proc.signalCode === null) {
     proc.kill("SIGTERM");
     // Force kill after 5s if still alive
@@ -217,6 +255,199 @@ export function killAgent(proc: ChildProcess): void {
       }
     }, 5_000).unref();
   }
+}
+
+export async function killAgentAndWait(
+  proc: ChildProcess,
+  timeoutMs = 6_000,
+  options: {
+    platform?: NodeJS.Platform;
+    killWindowsProcessTree?: (pid: number, timeoutMs: number) => Promise<void>;
+    killPosixProcessGroup?: (pid: number, timeoutMs: number) => Promise<void>;
+  } = {},
+): Promise<void> {
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    const retainedFailure = uncertainWindowsProcessTrees.get(proc);
+    const wrapperExited =
+      proc.exitCode !== null || proc.signalCode !== null;
+    if (retainedFailure && wrapperExited) throw retainedFailure.error;
+    if (wrapperExited) {
+      // A natural shell exit has no actionable tree root. Only a prior
+      // taskkill failure leaves evidence that cleanup is uncertain.
+      return;
+    }
+    if (proc.pid === undefined) {
+      throw new Error("Cannot stop agent process tree without a process ID");
+    }
+    try {
+      await (
+        options.killWindowsProcessTree ?? killWindowsProcessTree
+      )(proc.pid, timeoutMs);
+    } catch (err) {
+      // If the wrapper exits before a later retry, its PID can be reused and
+      // Windows cannot prove that every former descendant is gone.
+      uncertainWindowsProcessTrees.set(proc, { error: err });
+      throw err;
+    }
+    uncertainWindowsProcessTrees.delete(proc);
+    return;
+  }
+
+  if (proc.pid !== undefined) {
+    await (
+      options.killPosixProcessGroup ?? killPosixProcessGroup
+    )(proc.pid, timeoutMs);
+    return;
+  }
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+
+  let settle!: () => void;
+  const exited = new Promise<void>((resolve) => {
+    settle = resolve;
+    proc.once("exit", settle);
+    proc.once("close", settle);
+  });
+  killAgent(proc);
+  if (proc.exitCode !== null || proc.signalCode !== null) {
+    proc.off("exit", settle);
+    proc.off("close", settle);
+    return;
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      exited,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`Agent process did not exit within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    proc.off("exit", settle);
+    proc.off("close", settle);
+  }
+}
+
+async function killPosixProcessGroup(
+  pid: number,
+  timeoutMs: number,
+): Promise<void> {
+  if (!signalPosixProcessGroup(pid, "SIGTERM")) return;
+  const startedAt = Date.now();
+  const forceAfterMs = Math.min(5_000, Math.max(0, timeoutMs - 100));
+  let forceSent = false;
+
+  while (isPosixProcessGroupRunning(pid)) {
+    const elapsed = Date.now() - startedAt;
+    if (!forceSent && elapsed >= forceAfterMs) {
+      if (!signalPosixProcessGroup(pid, "SIGKILL")) return;
+      forceSent = true;
+    }
+    if (elapsed >= timeoutMs) {
+      throw new Error(
+        `Agent process group ${pid} did not exit within ${timeoutMs}ms`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function signalPosixProcessGroup(
+  pid: number,
+  signal: NodeJS.Signals,
+): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch (err) {
+    if (hasErrorCode(err, "ESRCH")) return false;
+    throw err;
+  }
+}
+
+function isPosixProcessGroupRunning(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    if (hasErrorCode(err, "ESRCH")) return false;
+    if (hasErrorCode(err, "EPERM")) return true;
+    throw err;
+  }
+}
+
+function hasErrorCode(err: unknown, code: string): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    err.code === code
+  );
+}
+
+async function killWindowsProcessTree(
+  pid: number,
+  timeoutMs: number,
+): Promise<void> {
+  const taskkill = spawn(
+    "taskkill.exe",
+    ["/PID", String(pid), "/T", "/F"],
+    {
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true,
+    },
+  );
+  let stderr = "";
+  taskkill.stderr?.setEncoding("utf8");
+  taskkill.stderr?.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      taskkill.off("error", onError);
+      taskkill.off("close", onClose);
+      if (err) reject(err);
+      else resolve();
+    };
+    const onError = (err: Error) => {
+      finish(new Error(`Failed to start taskkill for agent process ${pid}`, {
+        cause: err,
+      }));
+    };
+    const onClose = (code: number | null) => {
+      if (code === 0) {
+        finish();
+        return;
+      }
+      const detail = stderr.trim();
+      finish(
+        new Error(
+          `taskkill failed for agent process ${pid} with exit code ${String(code)}${detail ? `: ${detail}` : ""}`,
+        ),
+      );
+    };
+    const timeout = setTimeout(() => {
+      taskkill.kill();
+      finish(
+        new Error(
+          `Agent process tree ${pid} did not exit within ${timeoutMs}ms`,
+        ),
+      );
+    }, timeoutMs);
+    timeout.unref();
+    taskkill.once("error", onError);
+    taskkill.once("close", onClose);
+  });
 }
 
 function abortable<T>(

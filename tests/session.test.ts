@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import type { ChildProcess } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { test } from "node:test";
 
 import {
@@ -13,6 +15,7 @@ test("concurrent session creation reserves maxConcurrentUsers capacity", async (
     agentCwd: process.cwd(),
     idleTimeoutMs: 0,
     maxConcurrentUsers: 1,
+    killAgentProcess: async () => {},
     showThoughts: false,
     log: () => {},
     onReply: async () => {},
@@ -31,7 +34,11 @@ test("concurrent session creation reserves maxConcurrentUsers capacity", async (
       contextToken,
       client: {} as never,
       agentInfo: {
-        process: { killed: true } as never,
+        process: {
+          killed: false,
+          exitCode: null,
+          signalCode: null,
+        } as never,
         connection: {} as never,
         sessionId: userId,
         configOptions: [],
@@ -51,10 +58,13 @@ test("concurrent session creation reserves maxConcurrentUsers capacity", async (
       session.processing = true;
       return session;
     });
-  const second = internal.getOrCreateSession("user-2", "context-2");
+  const second = assert.rejects(
+    internal.getOrCreateSession("user-2", "context-2"),
+    /Maximum concurrent sessions reached/,
+  );
 
   assert.equal((await first).userId, "user-1");
-  await assert.rejects(second, /Maximum concurrent sessions reached/);
+  await second;
   assert.deepEqual(createdUsers, ["user-1"]);
   await manager.stop();
 });
@@ -66,6 +76,7 @@ test("SessionManager.stop waits for every MCP lease before reporting failures", 
     agentCwd: process.cwd(),
     idleTimeoutMs: 0,
     maxConcurrentUsers: 2,
+    killAgentProcess: async () => {},
     showThoughts: false,
     log: () => {},
     onReply: async () => {},
@@ -84,7 +95,11 @@ test("SessionManager.stop waits for every MCP lease before reporting failures", 
     contextToken: `${userId}-context`,
     client: {} as never,
     agentInfo: {
-      process: { killed: true } as never,
+      process: {
+        killed: false,
+        exitCode: null,
+        signalCode: null,
+      } as never,
       connection: {} as never,
       sessionId: userId,
       configOptions: [],
@@ -165,6 +180,12 @@ function makeTurnSession(opts: {
     reject: (err: unknown) => void;
   };
 }): UserSession {
+  const agentProcess = new EventEmitter() as unknown as ChildProcess;
+  Object.defineProperties(agentProcess, {
+    killed: { value: false, writable: true },
+    exitCode: { value: null, writable: true },
+    signalCode: { value: null, writable: true },
+  });
   return {
     userId: "user-1",
     contextToken: "initial-context",
@@ -179,8 +200,9 @@ function makeTurnSession(opts: {
       hasProducedMessage: opts.producedMessage,
     } as never,
     agentInfo: {
-      process: { killed: false, exitCode: null } as never,
+      process: agentProcess,
       connection: {
+        closed: new Promise<void>(() => {}),
         prompt: async () => {
           opts.events.push("prompt");
           return { stopReason: opts.stopReason ?? "end_turn" };
@@ -200,6 +222,18 @@ function makeTurnSession(opts: {
     lastActivity: Date.now(),
     createdAt: Date.now(),
   };
+}
+
+async function processTurn(
+  manager: SessionManager,
+  session: UserSession,
+): Promise<void> {
+  const internal = manager as unknown as {
+    sessions: Map<string, UserSession>;
+    processQueue(session: UserSession): Promise<void>;
+  };
+  internal.sessions.set(session.userId, session);
+  await internal.processQueue(session);
 }
 
 test("configured turn end message is sent standalone after final buffered text", async () => {
@@ -224,9 +258,7 @@ test("configured turn end message is sent standalone after final buffered text",
     events,
   });
 
-  await (
-    manager as unknown as { processQueue(session: UserSession): Promise<void> }
-  ).processQueue(session);
+  await processTurn(manager, session);
 
   assert.deepEqual(events, [
     "begin",
@@ -259,9 +291,7 @@ test("configured turn end message is sent when all agent text was already stream
     events: [],
   });
 
-  await (
-    manager as unknown as { processQueue(session: UserSession): Promise<void> }
-  ).processQueue(session);
+  await processTurn(manager, session);
 
   assert.deepEqual(replies, ["Done"]);
 });
@@ -287,9 +317,7 @@ test("turn end message remains disabled when it is not configured", async () => 
     events: [],
   });
 
-  await (
-    manager as unknown as { processQueue(session: UserSession): Promise<void> }
-  ).processQueue(session);
+  await processTurn(manager, session);
 
   assert.deepEqual(replies, ["Final answer"]);
 });
@@ -327,9 +355,7 @@ for (const { stopReason, expectedReply } of [
       stopReason,
     });
 
-    await (
-      manager as unknown as { processQueue(session: UserSession): Promise<void> }
-    ).processQueue(session);
+    await processTurn(manager, session);
 
     assert.deepEqual(replies, [expectedReply, "Done"]);
   });
@@ -357,9 +383,7 @@ test("configured turn end message follows the empty-turn notice", async () => {
     events: [],
   });
 
-  await (
-    manager as unknown as { processQueue(session: UserSession): Promise<void> }
-  ).processQueue(session);
+  await processTurn(manager, session);
 
   assert.deepEqual(replies, [
     "ℹ️ The agent finished without sending a reply. Try rephrasing your request.",
@@ -405,9 +429,7 @@ test("turn end message delivery failure does not fail a completed prompt", async
     },
   });
 
-  await (
-    manager as unknown as { processQueue(session: UserSession): Promise<void> }
-  ).processQueue(session);
+  await processTurn(manager, session);
 
   assert.deepEqual(replies, ["Final answer", "Done"]);
   assert.deepEqual(completions, ["resolved"]);
@@ -445,9 +467,7 @@ test("a new ACP session is persisted after its first completed prompt", async ()
     events: [],
   });
 
-  await (
-    manager as unknown as { processQueue(session: UserSession): Promise<void> }
-  ).processQueue(session);
+  await processTurn(manager, session);
 
   assert.deepEqual(persisted, ["user-1:session-1"]);
   assert.equal(session.sessionIdPersisted, true);

@@ -6,8 +6,14 @@ import { test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-import { startArtifactMcpServer } from "../src/artifacts/server.js";
+import {
+  closeArtifactSessions,
+  closeLease,
+  startArtifactMcpServer,
+} from "../src/artifacts/server.js";
 import {
   ArtifactStore,
   sanitizeFileName,
@@ -31,6 +37,130 @@ test("sanitizeFileName strips line and bidirectional controls", () => {
     ),
     "report evil .pdf",
   );
+});
+
+test("artifact MCP lease closure retries failed sessions", async () => {
+  const token = "lease-token";
+  const sessionId = "session-id";
+  const sessionIds = new Set([sessionId]);
+  const lease = {
+    sessionIds,
+    inFlightInitializations: new Set<Promise<void>>(),
+    closing: false,
+  };
+  const leases = new Map([[token, lease]]);
+  let closeAttempts = 0;
+  const session = {
+    mcp: {
+      close: async () => {
+        closeAttempts++;
+        if (closeAttempts === 1) {
+          throw new Error("close failed");
+        }
+      },
+    } as unknown as McpServer,
+    transport: {} as StreamableHTTPServerTransport,
+    leaseToken: token,
+  };
+  const sessions = new Map([[sessionId, session]]);
+
+  await assert.rejects(
+    closeLease(token, lease, leases, sessions),
+    /Failed to close artifact MCP lease/,
+  );
+  assert.equal(leases.has(token), false);
+  assert.equal(sessionIds.has(sessionId), true);
+  assert.equal(sessions.has(sessionId), true);
+
+  await closeLease(token, lease, leases, sessions);
+  assert.equal(closeAttempts, 2);
+  assert.equal(sessionIds.size, 0);
+  assert.equal(sessions.size, 0);
+});
+
+test("artifact MCP lease closure drains an in-flight initialization", async () => {
+  const token = "lease-token";
+  const sessionId = "late-session";
+  const lease = {
+    sessionIds: new Set<string>(),
+    inFlightInitializations: new Set<Promise<void>>(),
+    closing: false,
+  };
+  const leases = new Map([[token, lease]]);
+  let closeAttempts = 0;
+  const session = {
+    mcp: {
+      close: async () => {
+        closeAttempts++;
+      },
+    } as unknown as McpServer,
+    transport: {} as StreamableHTTPServerTransport,
+    leaseToken: token,
+  };
+  const sessions = new Map<string, typeof session>();
+  let finishRequest!: () => void;
+  const request = new Promise<void>((resolve) => {
+    finishRequest = () => {
+      sessions.set(sessionId, session);
+      lease.sessionIds.add(sessionId);
+      resolve();
+    };
+  });
+  lease.inFlightInitializations.add(request);
+
+  const closing = closeLease(token, lease, leases, sessions);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(lease.closing, true);
+  assert.equal(leases.has(token), false);
+  assert.equal(closeAttempts, 0);
+
+  finishRequest();
+  await closing;
+  assert.equal(closeAttempts, 1);
+  assert.equal(lease.sessionIds.size, 0);
+  assert.equal(sessions.size, 0);
+});
+
+test("artifact MCP shutdown drains an in-flight initialization", async () => {
+  const token = "lease-token";
+  const sessionId = "late-session";
+  const lease = {
+    sessionIds: new Set<string>(),
+    inFlightInitializations: new Set<Promise<void>>(),
+    closing: false,
+  };
+  const leases = new Map([[token, lease]]);
+  let closeAttempts = 0;
+  const session = {
+    mcp: {
+      close: async () => {
+        closeAttempts++;
+      },
+    } as unknown as McpServer,
+    transport: {} as StreamableHTTPServerTransport,
+    leaseToken: token,
+  };
+  const sessions = new Map<string, typeof session>();
+  let finishRequest!: () => void;
+  const request = new Promise<void>((resolve) => {
+    finishRequest = () => {
+      sessions.set(sessionId, session);
+      lease.sessionIds.add(sessionId);
+      resolve();
+    };
+  });
+  lease.inFlightInitializations.add(request);
+
+  const closing = closeArtifactSessions(leases, sessions);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(lease.closing, true);
+  assert.equal(leases.size, 0);
+  assert.equal(closeAttempts, 0);
+
+  finishRequest();
+  await closing;
+  assert.equal(closeAttempts, 1);
+  assert.equal(sessions.size, 0);
 });
 
 test("ArtifactStore snapshots allowed files and consumes artifacts once", async () => {

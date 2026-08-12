@@ -48,6 +48,17 @@ export class PendingTextRegistry {
     return entry.generation;
   }
 
+  clearExisting(userId: string): boolean {
+    const entry = this.entries.get(userId);
+    if (!entry) return false;
+    entry.generation++;
+    entry.segments = [];
+    entry.expiresAt = 0;
+    entry.contexts.clear();
+    entry.lastUsedAt = this.now();
+    return true;
+  }
+
   generationForContext(userId: string, contextToken: string): number | undefined {
     const entry = this.entries.get(userId);
     if (!entry) return undefined;
