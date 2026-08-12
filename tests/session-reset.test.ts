@@ -1000,6 +1000,7 @@ test("replacement permanently suppresses a buffered response from an exited proc
   const exiting = makeExitingProcess();
   const replies: string[] = [];
   const manager = makeManager({
+    maxConcurrentUsers: 1,
     killAgentProcess: async () => {},
     onReply: async (_userId, _contextToken, text) => {
       replies.push(text);
@@ -1011,6 +1012,7 @@ test("replacement permanently suppresses a buffered response from an exited proc
   );
   const internal = lifecycleInternals(manager);
   const replacement = makeSession("target");
+  const createdUsers: string[] = [];
   const creation = internal as typeof internal & {
     createSession(
       userId: string,
@@ -1022,7 +1024,10 @@ test("replacement permanently suppresses a buffered response from an exited proc
       contextToken: string,
     ): Promise<UserSession>;
   };
-  creation.createSession = async () => replacement;
+  creation.createSession = async (userId) => {
+    createdUsers.push(userId);
+    return userId === "target" ? replacement : makeSession(userId);
+  };
   internal.sessions.set("target", turn.session);
   const rejected = assert.rejects(turn.completion, /replaced/i);
   const processing = internal.processQueue(turn.session);
@@ -1030,10 +1035,16 @@ test("replacement permanently suppresses a buffered response from an exited proc
 
   internal.handleAgentExit("target", exiting.process);
   exiting.emitExit();
+  await assert.rejects(
+    creation.getOrCreateSession("other", "other-context"),
+    /Maximum concurrent sessions reached/,
+  );
+  assert.deepEqual(createdUsers, []);
   assert.equal(
     await creation.getOrCreateSession("target", "replacement-context"),
     replacement,
   );
+  assert.deepEqual(createdUsers, ["target"]);
   internal.sessions.delete("target");
   turn.resolvePrompt();
 
