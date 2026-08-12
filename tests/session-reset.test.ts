@@ -61,7 +61,9 @@ function makeSession(
     client: {} as never,
     agentInfo: {
       process: opts?.process ?? makeProcess([]),
-      connection: {} as never,
+      connection: {
+        closed: new Promise<void>(() => {}),
+      } as never,
       sessionId: `${userId}-session`,
       configOptions: [],
       sessionOutcome: "new",
@@ -113,6 +115,98 @@ function makeManager(opts?: {
     onReply: opts?.onReply ?? (async () => {}),
     sendTyping: async () => {},
   });
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (err: unknown) => void;
+} {
+  let resolve!: (value: T) => void;
+  let reject!: (err: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function makeExitingProcess(): {
+  process: ChildProcess;
+  emitExit: () => void;
+} {
+  const process = new EventEmitter() as ChildProcess;
+  let exitCode: number | null = null;
+  Object.defineProperties(process, {
+    pid: { value: 4242 },
+    killed: { value: false },
+    exitCode: { get: () => exitCode },
+    signalCode: { value: null },
+  });
+  return {
+    process,
+    emitExit: () => {
+      exitCode = 0;
+      process.emit("exit", 0, null);
+    },
+  };
+}
+
+function makeControlledTurn(
+  process: ChildProcess,
+  replyText: string,
+  connectionClosed = new Promise<void>(() => {}),
+): {
+  session: UserSession;
+  started: Promise<void>;
+  resolvePrompt: () => void;
+  completion: Promise<void>;
+} {
+  const started = deferred<void>();
+  const prompt = deferred<{ stopReason: "end_turn" }>();
+  const completion = deferred<void>();
+  const session = makeSession("target", {
+    process,
+    processing: true,
+    queue: [{
+      prompt: [],
+      contextToken: "context",
+      completion: {
+        resolve: () => completion.resolve(undefined),
+        reject: completion.reject,
+      },
+    }],
+  });
+  session.client = {
+    beginTurn: async () => {},
+    flush: async () => replyText,
+    hasProducedMessage: replyText.length > 0,
+  } as never;
+  session.agentInfo.connection = {
+    closed: connectionClosed,
+    prompt: async () => {
+      started.resolve(undefined);
+      return prompt.promise;
+    },
+  } as never;
+  return {
+    session,
+    started: started.promise,
+    resolvePrompt: () => prompt.resolve({ stopReason: "end_turn" }),
+    completion: completion.promise,
+  };
+}
+
+function lifecycleInternals(manager: SessionManager): {
+  sessions: Map<string, UserSession>;
+  handleAgentExit(userId: string, process: ChildProcess): void;
+  processQueue(session: UserSession): Promise<void>;
+} {
+  return manager as unknown as {
+    sessions: Map<string, UserSession>;
+    handleAgentExit(userId: string, process: ChildProcess): void;
+    processQueue(session: UserSession): Promise<void>;
+  };
 }
 
 test("different users can create sessions concurrently within capacity", async () => {
@@ -575,6 +669,7 @@ test("reset during beginTurn rejects the active completion", async () => {
     hasProducedMessage: false,
   } as never;
   session.agentInfo.connection = {
+    closed: new Promise<void>(() => {}),
     prompt: async () => ({ stopReason: "end_turn" }),
   } as never;
   const sessions = (
@@ -753,7 +848,7 @@ test("natural wrapper exit retains process-group cleanup for retry", async () =>
   assert.equal(processCleanupCalls, 2);
 });
 
-test("natural wrapper exit rejects the active completion immediately", async () => {
+test("natural wrapper exit before prompt dispatch rejects the active completion", async () => {
   const process = new EventEmitter() as ChildProcess;
   Object.defineProperties(process, {
     pid: { value: 4242 },
@@ -790,6 +885,158 @@ test("natural wrapper exit rejects the active completion immediately", async () 
 
   await rejected;
   assert.equal(session.activeMessage.completion, undefined);
+});
+
+test("natural wrapper exit drains a buffered final response", async () => {
+  const exiting = makeExitingProcess();
+  const replies: string[] = [];
+  const manager = makeManager({
+    killAgentProcess: async () => {},
+    onReply: async (_userId, _contextToken, text) => {
+      replies.push(text);
+    },
+  });
+  const turn = makeControlledTurn(
+    exiting.process,
+    "buffered final response",
+  );
+  const internal = lifecycleInternals(manager);
+  internal.sessions.set("target", turn.session);
+  const processing = internal.processQueue(turn.session);
+  await turn.started;
+
+  internal.handleAgentExit("target", exiting.process);
+  exiting.emitExit();
+  turn.resolvePrompt();
+
+  await turn.completion;
+  await processing;
+  assert.deepEqual(replies, ["buffered final response"]);
+  assert.equal(manager.getSession("target"), undefined);
+});
+
+test("reset waits for cleanup of a turn draining after process exit", async () => {
+  const exiting = makeExitingProcess();
+  let processCleanupCalls = 0;
+  let closeStarted!: () => void;
+  const startedClosing = new Promise<void>((resolve) => {
+    closeStarted = resolve;
+  });
+  let releaseClose!: () => void;
+  const closeReleased = new Promise<void>((resolve) => {
+    releaseClose = resolve;
+  });
+  const manager = makeManager({
+    killAgentProcess: async () => {
+      processCleanupCalls++;
+    },
+  });
+  const turn = makeControlledTurn(exiting.process, "obsolete response");
+  turn.session.mcpLease = {
+    mcpServer: {} as never,
+    close: async () => {
+      closeStarted();
+      await closeReleased;
+    },
+  };
+  const internal = lifecycleInternals(manager);
+  internal.sessions.set("target", turn.session);
+  const rejected = assert.rejects(turn.completion, /reset/i);
+  const processing = internal.processQueue(turn.session);
+  await turn.started;
+
+  internal.handleAgentExit("target", exiting.process);
+  exiting.emitExit();
+  let resetSettled = false;
+  const reset = manager.resetSession("target").then((result) => {
+    resetSettled = true;
+    return result;
+  });
+  await startedClosing;
+
+  assert.equal(resetSettled, false);
+  assert.equal(processCleanupCalls, 1);
+  releaseClose();
+  const result = await reset;
+  await rejected;
+  turn.resolvePrompt();
+  await processing;
+
+  assert.equal(result.hadActiveSession, true);
+  assert.equal(result.cancelledTurn, true);
+});
+
+test("connection closure after process exit rejects an unanswered prompt", async () => {
+  const exiting = makeExitingProcess();
+  const replies: string[] = [];
+  const manager = makeManager({
+    killAgentProcess: async () => {},
+    onReply: async (_userId, _contextToken, text) => {
+      replies.push(text);
+    },
+  });
+  const closed = deferred<void>();
+  const turn = makeControlledTurn(exiting.process, "", closed.promise);
+  const internal = lifecycleInternals(manager);
+  internal.sessions.set("target", turn.session);
+  const rejected = assert.rejects(turn.completion, /connection closed/i);
+  const processing = internal.processQueue(turn.session);
+  await turn.started;
+
+  internal.handleAgentExit("target", exiting.process);
+  exiting.emitExit();
+  closed.resolve(undefined);
+
+  await rejected;
+  await processing;
+  assert.deepEqual(replies, []);
+});
+
+test("replacement permanently suppresses a buffered response from an exited process", async () => {
+  const exiting = makeExitingProcess();
+  const replies: string[] = [];
+  const manager = makeManager({
+    killAgentProcess: async () => {},
+    onReply: async (_userId, _contextToken, text) => {
+      replies.push(text);
+    },
+  });
+  const turn = makeControlledTurn(
+    exiting.process,
+    "obsolete buffered response",
+  );
+  const internal = lifecycleInternals(manager);
+  const replacement = makeSession("target");
+  const creation = internal as typeof internal & {
+    createSession(
+      userId: string,
+      contextToken: string,
+      signal: AbortSignal,
+    ): Promise<UserSession>;
+    getOrCreateSession(
+      userId: string,
+      contextToken: string,
+    ): Promise<UserSession>;
+  };
+  creation.createSession = async () => replacement;
+  internal.sessions.set("target", turn.session);
+  const rejected = assert.rejects(turn.completion, /replaced/i);
+  const processing = internal.processQueue(turn.session);
+  await turn.started;
+
+  internal.handleAgentExit("target", exiting.process);
+  exiting.emitExit();
+  assert.equal(
+    await creation.getOrCreateSession("target", "replacement-context"),
+    replacement,
+  );
+  internal.sessions.delete("target");
+  turn.resolvePrompt();
+
+  await rejected;
+  await processing;
+  assert.deepEqual(replies, []);
+  assert.equal(manager.getSession("target"), undefined);
 });
 
 test("session creation rejects a process that already exited", async () => {
@@ -1071,6 +1318,7 @@ test("an old turn cannot reply or remove the replacement session after reset", a
     hasProducedMessage: true,
   } as never;
   oldSession.agentInfo.connection = {
+    closed: new Promise<void>(() => {}),
     prompt: async () => {
       promptStarted();
       await promptFinished;

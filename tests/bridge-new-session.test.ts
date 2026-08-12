@@ -6,7 +6,11 @@ import { WeChatAcpBridge } from "../src/bridge.js";
 import type { ResetSessionResult } from "../src/acp/session.js";
 import { BRIDGE_COMMANDS, defaultConfig } from "../src/config.js";
 import type { InjectedMessage } from "../src/inject/types.js";
-import { MessageType, type WeixinMessage } from "../src/weixin/types.js";
+import {
+  MessageType,
+  TypingStatus,
+  type WeixinMessage,
+} from "../src/weixin/types.js";
 
 class TestBridge extends WeChatAcpBridge {
   readonly enqueued: string[] = [];
@@ -14,7 +18,14 @@ class TestBridge extends WeChatAcpBridge {
   readonly resetUsers: string[] = [];
   readonly sent: Array<{ contextToken: string; segment: string }> = [];
   readonly events: string[] = [];
+  readonly typingStatuses: number[] = [];
   private readonly promptGenerations = new Map<string, number>();
+  private typingBlock:
+    | {
+        started: () => void;
+        release: Promise<void>;
+      }
+    | undefined;
   enqueueGate: Promise<void> | undefined;
   sendBehavior: (
     contextToken: string,
@@ -92,13 +103,90 @@ class TestBridge extends WeChatAcpBridge {
     );
   }
 
-  queueAgentReply(contextToken: string, text: string): Promise<void> {
+  queueAgentReply(
+    contextToken: string,
+    text: string,
+    isSessionCurrent?: () => boolean,
+  ): Promise<void> {
+    const replyGeneration = this.promptGenerations.get(contextToken);
+    if (replyGeneration === undefined) {
+      throw new Error(`No prompt generation for ${contextToken}`);
+    }
     return this.sendAgentReply(
       "user",
       contextToken,
       text,
-      this.promptGenerations.get(contextToken),
+      replyGeneration,
+      isSessionCurrent,
     );
+  }
+
+  seedTypingTicket(userId: string, ticket: string): void {
+    const internal = this as unknown as {
+      tokenData: {
+        token: string;
+        baseUrl: string;
+        accountId: string;
+        userId: string;
+        savedAt: string;
+      };
+      typingTickets: Map<string, { ticket: string; expiresAt: number }>;
+    };
+    internal.tokenData = {
+      token: "token",
+      baseUrl: "https://example.invalid",
+      accountId: "account",
+      userId: "bot",
+      savedAt: new Date().toISOString(),
+    };
+    internal.typingTickets.set(userId, {
+      ticket,
+      expiresAt: Date.now() + 60_000,
+    });
+  }
+
+  blockNextTyping(): { started: Promise<void>; release: () => void } {
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.typingBlock = {
+      started: markStarted,
+      release: released,
+    };
+    return { started, release };
+  }
+
+  queueTyping(
+    userId: string,
+    contextToken: string,
+    replyGeneration: number,
+  ): Promise<void> {
+    return this.sendTypingIndicator(userId, contextToken, replyGeneration);
+  }
+
+  currentGeneration(userId: string): number {
+    return this.messageGenerationForUser(userId);
+  }
+
+  protected override async sendTypingStatus(
+    _userId: string,
+    _ticket: string,
+    status: (typeof TypingStatus)[keyof typeof TypingStatus],
+  ): Promise<void> {
+    this.typingStatuses.push(status);
+    if (status === TypingStatus.TYPING && this.typingBlock) {
+      const block = this.typingBlock;
+      block.started();
+      await block.release;
+      if (this.typingBlock === block) {
+        this.typingBlock = undefined;
+      }
+    }
   }
 }
 
@@ -135,6 +223,50 @@ test("acp-new and its alias reset without enqueueing an ACP prompt", async () =>
     bridge.sent.every(({ segment }) =>
       segment.includes("ACP session cleared")
     ),
+  );
+});
+
+test("acp-new waits for stale typing to finish before sending cancel", async () => {
+  const bridge = makeBridge();
+  bridge.seedTypingTicket("user", "ticket");
+  const block = bridge.blockNextTyping();
+  const typing = bridge.queueTyping(
+    "user",
+    "typing-context",
+    bridge.currentGeneration("user"),
+  );
+  await block.started;
+
+  let resetSettled = false;
+  const reset = bridge
+    .handleMessage(textMessage(BRIDGE_COMMANDS.acpNew, "reset-context"))
+    .then(() => {
+      resetSettled = true;
+    });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(resetSettled, false);
+  assert.deepEqual(bridge.typingStatuses, [TypingStatus.TYPING]);
+
+  block.release();
+  await typing;
+  await reset;
+
+  assert.equal(bridge.typingStatuses[0], TypingStatus.TYPING);
+  assert.equal(
+    bridge.typingStatuses
+      .slice(1)
+      .every((status) => status === TypingStatus.CANCEL),
+    true,
+  );
+  assert.equal(bridge.typingStatuses.length >= 2, true);
+  assert.equal(
+    bridge.sent.some(
+      ({ contextToken, segment }) =>
+        contextToken === "reset-context" &&
+        segment.includes("ACP session cleared"),
+    ),
+    true,
   );
 });
 
@@ -396,6 +528,45 @@ test("a queued old agent reply is discarded at the reset boundary", async () => 
   );
   assert.ok(
     bridge.sent.some(({ segment }) => segment.includes("ACP session cleared")),
+  );
+});
+
+test("a queued reply is discarded when its session is replaced", async () => {
+  const bridge = makeBridge();
+  let blockerStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    blockerStarted = resolve;
+  });
+  let releaseBlocker!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    releaseBlocker = resolve;
+  });
+  bridge.sendBehavior = async (contextToken) => {
+    if (contextToken === "context-blocker") {
+      blockerStarted();
+      await blocked;
+    }
+    return true;
+  };
+
+  const blocker = bridge.handleMessage(
+    textMessage(BRIDGE_COMMANDS.acpMore, "context-blocker"),
+  );
+  await started;
+  bridge.beginPrompt("context-old");
+  let sessionCurrent = true;
+  const oldReply = bridge.queueAgentReply(
+    "context-old",
+    "OLD REPLACED REPLY",
+    () => sessionCurrent,
+  );
+  sessionCurrent = false;
+  releaseBlocker();
+  await Promise.all([blocker, oldReply]);
+
+  assert.equal(
+    bridge.sent.some(({ segment }) => segment === "OLD REPLACED REPLY"),
+    false,
   );
 });
 

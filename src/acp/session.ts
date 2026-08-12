@@ -65,6 +65,11 @@ export interface UserSession {
   processing: boolean;
   activeMessage?: PendingMessage;
   closedError?: Error;
+  processExitedError?: Error;
+  drainingExitedTurn?: boolean;
+  promptDispatched?: boolean;
+  exitCleanup?: Promise<void>;
+  connectionClosedError?: Promise<never>;
   lifecycleGeneration?: number;
   sessionIdPersisted?: boolean;
   lastActivity: number;
@@ -113,27 +118,36 @@ export interface SessionManagerOpts {
     contextToken: string,
     text: string,
     replyGeneration?: number,
+    isSessionCurrent?: () => boolean,
   ) => Promise<void>;
   onReplyImage?: (
     userId: string,
     contextToken: string,
     image: AgentImage,
     replyGeneration?: number,
+    isSessionCurrent?: () => boolean,
   ) => Promise<void>;
   onReplyAudio?: (
     userId: string,
     contextToken: string,
     audio: AgentAudio,
     replyGeneration?: number,
+    isSessionCurrent?: () => boolean,
   ) => Promise<void>;
   onReplyFile?: (
     userId: string,
     contextToken: string,
     file: AgentFile,
     replyGeneration?: number,
+    isSessionCurrent?: () => boolean,
   ) => Promise<void>;
   resolveResourceLink?: (link: AgentResourceLink) => Promise<AgentFile | null>;
-  sendTyping: (userId: string, contextToken: string) => Promise<void>;
+  sendTyping: (
+    userId: string,
+    contextToken: string,
+    replyGeneration?: number,
+    isSessionCurrent?: () => boolean,
+  ) => Promise<void>;
 }
 
 interface PendingSessionCreation {
@@ -155,6 +169,15 @@ class SessionResetError extends Error {
   }
 }
 
+class AgentConnectionClosedError extends Error {
+  constructor() {
+    super("Agent connection closed before the active operation completed");
+    this.name = "AgentConnectionClosedError";
+  }
+}
+
+const AGENT_EXIT_DRAIN_TIMEOUT_MS = 1_000;
+
 class SessionCreationCleanupError extends AggregateError {
   constructor(
     readonly creationError: unknown,
@@ -171,6 +194,7 @@ class SessionCreationCleanupError extends AggregateError {
 
 export class SessionManager {
   private sessions = new Map<string, UserSession>();
+  private exitedSessions = new Map<string, Set<UserSession>>();
   private pendingSessions = new Map<string, PendingSessionCreation>();
   private userLifecycleChains = new Map<string, Promise<void>>();
   private userGenerations = new Map<string, number>();
@@ -205,19 +229,20 @@ export class SessionManager {
     );
     await Promise.allSettled([...this.resetOperations.values()]);
 
-    for (const [userId, session] of this.sessions) {
-      this.opts.log(`Stopping session for ${userId}`);
+    const sessions = new Set([
+      ...this.sessions.values(),
+      ...[...this.exitedSessions.values()].flatMap((entries) => [...entries]),
+    ]);
+    for (const session of sessions) {
+      this.opts.log(`Stopping session for ${session.userId}`);
       session.closedError = new Error(
         "Session stopped before queued message was processed",
       );
       this.rejectSessionCompletions(session, session.closedError);
-      const cleanupState = this.getOrCreateCleanupState(userId);
-      cleanupState.processes.add(session.agentInfo.process);
-      if (session.mcpLease) {
-        cleanupState.mcpLeases.add(session.mcpLease);
-      }
+      this.registerSessionCleanup(session, true);
     }
     this.sessions.clear();
+    this.exitedSessions.clear();
     const results = await Promise.allSettled(
       [...this.cleanupStates.keys()].map((userId) =>
         this.retryCleanupState(userId)
@@ -422,23 +447,25 @@ export class SessionManager {
         throw new Error("Session manager is stopped");
       }
 
-      const session = this.sessions.get(userId);
+      const activeSession = this.sessions.get(userId);
+      const sessions = new Set([
+        ...(activeSession ? [activeSession] : []),
+        ...(this.exitedSessions.get(userId) ?? []),
+      ]);
       const resetError = new SessionResetError();
       let droppedQueueCount = 0;
       let cancelledTurn = false;
 
-      if (session) {
+      for (const session of sessions) {
         session.closedError = resetError;
-        cancelledTurn = session.processing;
-        droppedQueueCount = session.queue.length;
+        session.drainingExitedTurn = false;
+        cancelledTurn ||= session.processing;
+        droppedQueueCount += session.queue.length;
         this.rejectSessionCompletions(session, resetError);
-        this.sessions.delete(userId);
-        const cleanupState = this.getOrCreateCleanupState(userId);
-        cleanupState.processes.add(session.agentInfo.process);
-        if (session.mcpLease) {
-          cleanupState.mcpLeases.add(session.mcpLease);
-        }
+        this.registerSessionCleanup(session, true);
       }
+      this.sessions.delete(userId);
+      this.exitedSessions.delete(userId);
 
       if (this.opts.removePersistedSessionId) {
         this.getOrCreateCleanupState(userId).removePersistedSessionId = true;
@@ -447,7 +474,7 @@ export class SessionManager {
       await this.retryCleanupState(userId);
 
       return {
-        hadActiveSession: session !== undefined,
+        hadActiveSession: sessions.size > 0,
         cancelledTurn,
         cancelledPendingCreation: pending !== undefined,
         droppedQueueCount,
@@ -605,6 +632,7 @@ export class SessionManager {
         await this.retryCleanupState(userId);
         return winner;
       }
+      this.invalidateExitedSessions(userId);
       this.sessions.set(userId, created);
       if (
         created.agentInfo.process.exitCode !== null ||
@@ -813,12 +841,33 @@ export class SessionManager {
   ): Promise<UserSession> {
     this.opts.log(`Creating new session for ${userId}`);
 
+    let sessionRef: UserSession | undefined;
+    const isSessionCurrent = () =>
+      sessionRef === undefined || this.isCurrentSession(sessionRef);
     const client = new WeChatAcpClient({
-      sendTyping: () => this.opts.sendTyping(userId, contextToken),
+      sendTyping: () =>
+        this.opts.sendTyping(
+          userId,
+          contextToken,
+          replyGeneration,
+          isSessionCurrent,
+        ),
       onThoughtFlush: (text) =>
-        this.opts.onReply(userId, contextToken, text, replyGeneration),
+        this.opts.onReply(
+          userId,
+          contextToken,
+          text,
+          replyGeneration,
+          isSessionCurrent,
+        ),
       onMessageFlush: (text) =>
-        this.opts.onReply(userId, contextToken, text, replyGeneration),
+        this.opts.onReply(
+          userId,
+          contextToken,
+          text,
+          replyGeneration,
+          isSessionCurrent,
+        ),
       ...(this.opts.onReplyImage
         ? {
             onImageFlush: (image: AgentImage) =>
@@ -827,6 +876,7 @@ export class SessionManager {
                 contextToken,
                 image,
                 replyGeneration,
+                isSessionCurrent,
               ),
           }
         : {}),
@@ -838,6 +888,7 @@ export class SessionManager {
                 contextToken,
                 audio,
                 replyGeneration,
+                isSessionCurrent,
               ),
           }
         : {}),
@@ -849,6 +900,7 @@ export class SessionManager {
                 contextToken,
                 file,
                 replyGeneration,
+                isSessionCurrent,
               ),
           }
         : {}),
@@ -921,7 +973,7 @@ export class SessionManager {
       this.handleAgentExit(userId, agentInfo.process);
     });
 
-    return {
+    sessionRef = {
       userId,
       contextToken,
       client,
@@ -934,6 +986,7 @@ export class SessionManager {
       lastActivity: Date.now(),
       createdAt: Date.now(),
     };
+    return sessionRef;
   }
 
   private handleAgentExit(userId: string, agentProcess: ChildProcess): void {
@@ -941,13 +994,17 @@ export class SessionManager {
     if (!session || session.agentInfo.process !== agentProcess) return;
 
     this.opts.log(`Agent process for ${userId} exited, removing session`);
-    session.closedError = new Error(
+    session.processExitedError = new Error(
       "Agent process exited before queued message was processed",
     );
-    this.rejectSessionCompletions(session, session.closedError);
-    this.registerSessionCleanup(session, true);
+    this.rejectQueuedCompletions(session, session.processExitedError);
     this.sessions.delete(userId);
-    this.retryCleanupInBackground(userId, "Agent exit");
+    this.trackExitedSession(session);
+    if (session.promptDispatched) {
+      session.drainingExitedTurn = true;
+      return;
+    }
+    void this.finalizeExitedSession(session);
   }
 
   private async processQueue(session: UserSession): Promise<void> {
@@ -957,6 +1014,7 @@ export class SessionManager {
         session.activeMessage = pending;
         let completionError: unknown;
         const promptStartedAt = Date.now();
+        const isSessionCurrent = () => this.isCurrentSession(session);
 
         try {
           // Keep the ACP client instance stable because the connection is bound
@@ -965,10 +1023,15 @@ export class SessionManager {
           // prompt() rejected early) delivers with its own turn's callbacks
           // before the swap, and residual undelivered buffers are discarded at
           // the boundary instead of leaking into this turn (issue 54).
-          await session.client.beginTurn({
+          const beginTurn = session.client.beginTurn({
             sendTyping: () =>
               this.runIfCurrent(session, () =>
-                this.opts.sendTyping(session.userId, pending.contextToken),
+                this.opts.sendTyping(
+                  session.userId,
+                  pending.contextToken,
+                  pending.replyGeneration,
+                  isSessionCurrent,
+                ),
               ),
             onThoughtFlush: (text) =>
               this.runIfCurrent(session, () =>
@@ -977,6 +1040,7 @@ export class SessionManager {
                   pending.contextToken,
                   text,
                   pending.replyGeneration,
+                  isSessionCurrent,
                 ),
               ),
             onMessageFlush: (text) =>
@@ -986,6 +1050,7 @@ export class SessionManager {
                   pending.contextToken,
                   text,
                   pending.replyGeneration,
+                  isSessionCurrent,
                 ),
               ),
             ...(this.opts.onReplyImage
@@ -997,6 +1062,7 @@ export class SessionManager {
                         pending.contextToken,
                         image,
                         pending.replyGeneration,
+                        isSessionCurrent,
                       ),
                     ),
                 }
@@ -1010,6 +1076,7 @@ export class SessionManager {
                         pending.contextToken,
                         audio,
                         pending.replyGeneration,
+                        isSessionCurrent,
                       ),
                     ),
                 }
@@ -1023,11 +1090,17 @@ export class SessionManager {
                         pending.contextToken,
                         file,
                         pending.replyGeneration,
+                        isSessionCurrent,
                       ),
                     ),
                 }
               : {}),
           });
+          await this.awaitAgentOperation(
+            session,
+            beginTurn,
+            "turn setup",
+          );
 
           if (!this.isCurrentSession(session)) {
             completionError = session.closedError ?? new SessionResetError();
@@ -1036,15 +1109,25 @@ export class SessionManager {
 
           // Send typing immediately so user knows the prompt was received
           this.runIfCurrent(session, () =>
-            this.opts.sendTyping(session.userId, pending.contextToken),
+            this.opts.sendTyping(
+              session.userId,
+              pending.contextToken,
+              pending.replyGeneration,
+              isSessionCurrent,
+            ),
           ).catch(() => {});
 
           // Send ACP prompt
           this.opts.log(`[${session.userId}] Sending prompt to agent...`);
-          const result = await session.agentInfo.connection.prompt({
-            sessionId: session.agentInfo.sessionId,
-            prompt: pending.prompt,
-          });
+          session.promptDispatched = true;
+          const result = await this.awaitAgentOperation(
+            session,
+            session.agentInfo.connection.prompt({
+              sessionId: session.agentInfo.sessionId,
+              prompt: pending.prompt,
+            }),
+            "prompt response",
+          );
           if (!this.isCurrentSession(session)) {
             completionError = session.closedError ?? new SessionResetError();
             continue;
@@ -1086,6 +1169,7 @@ export class SessionManager {
               pending.contextToken,
               replyText,
               pending.replyGeneration,
+              isSessionCurrent,
             );
           } else if (!session.client.hasProducedMessage) {
             // The turn ended without the agent ever producing a textual reply
@@ -1099,6 +1183,7 @@ export class SessionManager {
               pending.contextToken,
               emptyTurnNotice(result.stopReason),
               pending.replyGeneration,
+              isSessionCurrent,
             );
           }
 
@@ -1114,6 +1199,7 @@ export class SessionManager {
                 pending.contextToken,
                 this.opts.turnEndMessage,
                 pending.replyGeneration,
+                isSessionCurrent,
               );
             } catch (err) {
               this.opts.log(
@@ -1144,27 +1230,20 @@ export class SessionManager {
           );
 
           // Check if agent died
-          if (session.agentInfo.process.killed || session.agentInfo.process.exitCode !== null) {
+          if (
+            session.agentInfo.process.killed ||
+            session.agentInfo.process.exitCode !== null ||
+            session.processExitedError !== undefined ||
+            err instanceof AgentConnectionClosedError
+          ) {
             this.opts.log(`[${session.userId}] Agent process died, removing session`);
             session.closedError =
               err instanceof Error ? err : new Error(String(err));
             this.rejectSessionCompletions(session, err);
             if (this.sessions.get(session.userId) === session) {
-              this.registerSessionCleanup(session, true);
               this.sessions.delete(session.userId);
             }
-            try {
-              await this.retryCleanupState(session.userId);
-            } catch (cleanupErr) {
-              this.opts.log(
-                `[${session.userId}] Agent failure cleanup was retained for retry: ${String(cleanupErr)}`,
-              );
-              trackException(
-                cleanupErr,
-                "session.cleanup",
-                hashUserId(session.userId),
-              );
-            }
+            await this.finalizeExitedSession(session);
             return;
           }
 
@@ -1175,11 +1254,13 @@ export class SessionManager {
               pending.contextToken,
               `⚠️ Agent error: ${String(err)}`,
               pending.replyGeneration,
+              isSessionCurrent,
             );
           } catch {
             // best effort
           }
         } finally {
+          session.promptDispatched = false;
           if (pending.completion) {
             const finalError = session.closedError ?? completionError;
             if (finalError) {
@@ -1195,6 +1276,9 @@ export class SessionManager {
       }
     } finally {
       session.processing = false;
+      if (session.processExitedError) {
+        await this.finalizeExitedSession(session);
+      }
     }
   }
 
@@ -1250,6 +1334,10 @@ export class SessionManager {
       session.activeMessage.completion.reject(err);
       session.activeMessage.completion = undefined;
     }
+    this.rejectQueuedCompletions(session, err);
+  }
+
+  private rejectQueuedCompletions(session: UserSession, err: unknown): void {
     for (const pending of session.queue.splice(0)) {
       pending.completion?.reject(err);
     }
@@ -1269,8 +1357,107 @@ export class SessionManager {
     const current = this.sessions.get(session.userId);
     return (
       current === session ||
-      (current === undefined && session.closedError === undefined)
+      (
+        current === undefined &&
+        session.drainingExitedTurn === true &&
+        session.closedError === undefined
+      )
     );
+  }
+
+  private async awaitAgentOperation<T>(
+    session: UserSession,
+    operation: Promise<T>,
+    operationName: string,
+  ): Promise<T> {
+    const process = session.agentInfo.process;
+    let onExit: (() => void) | undefined;
+    const processExited =
+      process.exitCode !== null || process.signalCode !== null
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => {
+            onExit = resolve;
+            process.once("exit", onExit);
+          });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const exitTimeout = processExited.then(
+      () =>
+        new Promise<never>((_resolve, reject) => {
+          timeout = setTimeout(
+            () =>
+              reject(
+                new Error(
+                  `${operationName} did not finish within ${AGENT_EXIT_DRAIN_TIMEOUT_MS}ms after agent process exit`,
+                ),
+              ),
+            AGENT_EXIT_DRAIN_TIMEOUT_MS,
+          );
+        }),
+    );
+    session.connectionClosedError ??=
+      session.agentInfo.connection.closed.then(() => {
+        throw new AgentConnectionClosedError();
+      });
+
+    try {
+      return await Promise.race([
+        operation,
+        session.connectionClosedError,
+        exitTimeout,
+      ]);
+    } finally {
+      if (onExit) process.off("exit", onExit);
+      if (timeout) clearTimeout(timeout);
+    }
+  }
+
+  private finalizeExitedSession(session: UserSession): Promise<void> {
+    if (session.exitCleanup) return session.exitCleanup;
+    session.drainingExitedTurn = false;
+    const error =
+      session.closedError ??
+      session.processExitedError ??
+      new Error("Agent process exited");
+    session.closedError = error;
+    this.rejectSessionCompletions(session, error);
+    this.registerSessionCleanup(session, true);
+    session.exitCleanup = this.retryCleanupState(session.userId).catch((err) => {
+      this.opts.log(
+        `[${session.userId}] Agent exit cleanup failed and was retained for retry: ${String(err)}`,
+      );
+      trackException(err, "session.cleanup", hashUserId(session.userId));
+    }).finally(() => {
+      this.untrackExitedSession(session);
+    });
+    return session.exitCleanup;
+  }
+
+  private trackExitedSession(session: UserSession): void {
+    const sessions =
+      this.exitedSessions.get(session.userId) ?? new Set<UserSession>();
+    sessions.add(session);
+    this.exitedSessions.set(session.userId, sessions);
+  }
+
+  private invalidateExitedSessions(userId: string): void {
+    for (const session of this.exitedSessions.get(userId) ?? []) {
+      if (!session.drainingExitedTurn) continue;
+      session.closedError = new Error(
+        "Agent session was replaced before its response was delivered",
+      );
+      session.drainingExitedTurn = false;
+      this.rejectSessionCompletions(session, session.closedError);
+      void this.finalizeExitedSession(session);
+    }
+  }
+
+  private untrackExitedSession(session: UserSession): void {
+    const sessions = this.exitedSessions.get(session.userId);
+    if (!sessions) return;
+    sessions.delete(session);
+    if (sessions.size === 0) {
+      this.exitedSessions.delete(session.userId);
+    }
   }
 
   private isUserGenerationCurrent(
@@ -1291,6 +1478,7 @@ export class SessionManager {
     if (
       session.sessionIdPersisted ||
       !this.opts.persistSessionId ||
+      session.processExitedError !== undefined ||
       !this.isCurrentSession(session)
     ) {
       return;

@@ -86,6 +86,7 @@ export class WeChatAcpBridge {
   private stateUpdate = Promise.resolve();
   // Per-user typing ticket cache
   private typingTickets = new Map<string, { ticket: string; expiresAt: number }>();
+  private typingChains = new Map<string, Promise<void>>();
   // Timestamp (ms) at which the last text message was issued to each user,
   // used to pace consecutive sends so they don't race and arrive reordered.
   private lastSendAt = new Map<string, number>();
@@ -219,38 +220,77 @@ export class WeChatAcpBridge {
           ? () => this.artifactMcpServer!.createLease()
           : undefined,
         log: this.log,
-        onReply: (userId, contextToken, text, replyGeneration) =>
+        onReply: (
+          userId,
+          contextToken,
+          text,
+          replyGeneration,
+          isSessionCurrent,
+        ) =>
           this.sendAgentReply(
             userId,
             contextToken,
             text,
-            replyGeneration,
+            this.requireReplyGeneration(replyGeneration),
+            isSessionCurrent,
           ),
-        onReplyImage: (userId, contextToken, image, replyGeneration) =>
+        onReplyImage: (
+          userId,
+          contextToken,
+          image,
+          replyGeneration,
+          isSessionCurrent,
+        ) =>
           this.sendImageReply(
             userId,
             contextToken,
             image,
-            replyGeneration,
+            this.requireReplyGeneration(replyGeneration),
+            isSessionCurrent,
           ),
-        onReplyAudio: (userId, contextToken, audio, replyGeneration) =>
+        onReplyAudio: (
+          userId,
+          contextToken,
+          audio,
+          replyGeneration,
+          isSessionCurrent,
+        ) =>
           this.sendAudioReply(
             userId,
             contextToken,
             audio,
-            replyGeneration,
+            this.requireReplyGeneration(replyGeneration),
+            isSessionCurrent,
           ),
-        onReplyFile: (userId, contextToken, file, replyGeneration) =>
+        onReplyFile: (
+          userId,
+          contextToken,
+          file,
+          replyGeneration,
+          isSessionCurrent,
+        ) =>
           this.sendFileReply(
             userId,
             contextToken,
             file,
-            replyGeneration,
+            this.requireReplyGeneration(replyGeneration),
+            isSessionCurrent,
           ),
         resolveResourceLink: this.artifactMcpServer
           ? (link) => this.artifactMcpServer!.resolveResourceLink(link)
           : undefined,
-        sendTyping: (userId, contextToken) => this.sendTypingIndicator(userId, contextToken),
+        sendTyping: (
+          userId,
+          contextToken,
+          replyGeneration,
+          isSessionCurrent,
+        ) =>
+          this.sendTypingIndicator(
+            userId,
+            contextToken,
+            this.requireReplyGeneration(replyGeneration),
+            isSessionCurrent,
+          ),
       });
       this.sessionManager.start();
 
@@ -517,9 +557,16 @@ export class WeChatAcpBridge {
     this.bufferFlushing.delete(userId);
     this.clearBufferTimer(userId);
     this.pendingText.clearExisting(userId);
+    const typingCancellation = this.cancelTypingIndicator(
+      userId,
+      contextToken,
+    ).catch((err) => {
+      this.log(`Failed to cancel typing for ${userId}: ${String(err)}`);
+    });
 
     try {
       const result = await this.resetUserSession(userId);
+      await typingCancellation;
       if (!this.isMessageGenerationCurrent(userId, generation)) return;
       trackEvent(
         "command.acp_new",
@@ -533,13 +580,13 @@ export class WeChatAcpBridge {
         },
         hashUserId(userId),
       );
-      this.cancelTypingIndicator(userId, contextToken).catch(() => {});
       await this.sendReply(
         userId,
         contextToken,
         this.formatAcpNewResult(result, droppedBufferedBlockCount),
       );
     } catch (err) {
+      await typingCancellation;
       this.log(`Failed to reset ACP session for ${userId}: ${String(err)}`);
       trackException(err, "session.reset", hashUserId(userId));
       if (!this.isMessageGenerationCurrent(userId, generation)) return;
@@ -1068,18 +1115,22 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
     text: string,
-    replyGeneration?: number,
+    replyGeneration: number,
+    isSessionCurrent: () => boolean = () => true,
   ): Promise<void> {
-    if (replyGeneration === undefined) return;
     const generation = this.pendingText.generationForContext(userId, contextToken);
-    return this.queueAgentSendTask(userId, replyGeneration, (isCurrent) =>
-      this.deliverReply(
-        userId,
-        contextToken,
-        text,
-        generation,
-        isCurrent,
-      ),
+    return this.queueAgentSendTask(
+      userId,
+      replyGeneration,
+      (isCurrent) =>
+        this.deliverReply(
+          userId,
+          contextToken,
+          text,
+          generation,
+          isCurrent,
+        ),
+      isSessionCurrent,
     );
   }
 
@@ -1087,8 +1138,10 @@ export class WeChatAcpBridge {
     userId: string,
     generation: number,
     task: (isCurrent: () => boolean) => Promise<void>,
+    isSessionCurrent: () => boolean = () => true,
   ): Promise<void> {
     const isCurrent = () =>
+      isSessionCurrent() &&
       this.isMessageGenerationCurrent(userId, generation);
     return this.queueSendTask(userId, () => {
       if (!isCurrent()) {
@@ -1201,13 +1254,17 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
     image: AgentImage,
-    replyGeneration?: number,
+    replyGeneration: number,
+    isSessionCurrent?: () => boolean,
   ): Promise<void> {
-    if (replyGeneration === undefined) return;
     // Ride the same per-user chain as text replies so an image cannot
     // interleave with the segments of a concurrent text reply.
-    return this.queueAgentSendTask(userId, replyGeneration, (isCurrent) =>
-      this.deliverImage(userId, contextToken, image, isCurrent),
+    return this.queueAgentSendTask(
+      userId,
+      replyGeneration,
+      (isCurrent) =>
+        this.deliverImage(userId, contextToken, image, isCurrent),
+      isSessionCurrent,
     );
   }
 
@@ -1277,7 +1334,8 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
     audio: AgentAudio,
-    replyGeneration?: number,
+    replyGeneration: number,
+    isSessionCurrent?: () => boolean,
   ): Promise<void> {
     const mime = audio.mimeType.trim().toLowerCase();
     const ext = Object.hasOwn(AUDIO_MIME_EXTENSIONS, mime) ? AUDIO_MIME_EXTENSIONS[mime] : "bin";
@@ -1288,6 +1346,7 @@ export class WeChatAcpBridge {
       { data: audio.data, name: fileName, mimeType: audio.mimeType },
       "audio",
       replyGeneration,
+      isSessionCurrent,
     );
   }
 
@@ -1295,7 +1354,8 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
     file: AgentFile,
-    replyGeneration?: number,
+    replyGeneration: number,
+    isSessionCurrent?: () => boolean,
   ): Promise<void> {
     return this.queueFileReply(
       userId,
@@ -1303,6 +1363,7 @@ export class WeChatAcpBridge {
       file,
       "file",
       replyGeneration,
+      isSessionCurrent,
     );
   }
 
@@ -1311,19 +1372,23 @@ export class WeChatAcpBridge {
     contextToken: string,
     file: AgentFile,
     telemetryKind: "audio" | "file",
-    replyGeneration?: number,
+    replyGeneration: number,
+    isSessionCurrent?: () => boolean,
   ): Promise<void> {
-    if (replyGeneration === undefined) return;
     // Ride the same per-user chain as text and image replies so a file cannot
     // interleave with the segments of a concurrent reply.
-    return this.queueAgentSendTask(userId, replyGeneration, (isCurrent) =>
-      this.deliverFile(
-        userId,
-        contextToken,
-        file,
-        telemetryKind,
-        isCurrent,
-      ),
+    return this.queueAgentSendTask(
+      userId,
+      replyGeneration,
+      (isCurrent) =>
+        this.deliverFile(
+          userId,
+          contextToken,
+          file,
+          telemetryKind,
+          isCurrent,
+        ),
+      isSessionCurrent,
     );
   }
 
@@ -1410,37 +1475,76 @@ export class WeChatAcpBridge {
   }
 
   private async cancelTypingIndicator(userId: string, contextToken: string): Promise<void> {
-    const ticket = await this.getTypingTicket(userId, contextToken);
-    if (!ticket) return;
+    return this.queueTypingTask(userId, async () => {
+      const ticket = await this.getTypingTicket(userId, contextToken);
+      if (!ticket) return;
+      await this.sendTypingStatus(userId, ticket, TypingStatus.CANCEL);
+    });
+  }
 
+  protected async sendTypingIndicator(
+    userId: string,
+    contextToken: string,
+    replyGeneration: number,
+    isSessionCurrent: () => boolean = () => true,
+  ): Promise<void> {
+    return this.queueTypingTask(userId, async () => {
+      if (
+        !isSessionCurrent() ||
+        !this.isMessageGenerationCurrent(userId, replyGeneration)
+      ) {
+        return;
+      }
+      try {
+        const ticket = await this.getTypingTicket(userId, contextToken);
+        if (
+          !ticket ||
+          !isSessionCurrent() ||
+          !this.isMessageGenerationCurrent(userId, replyGeneration)
+        ) {
+          return;
+        }
+        await this.sendTypingStatus(
+          userId,
+          ticket,
+          TypingStatus.TYPING,
+        );
+      } catch {
+        // Typing is best-effort
+      }
+    });
+  }
+
+  protected async sendTypingStatus(
+    userId: string,
+    ticket: string,
+    status: (typeof TypingStatus)[keyof typeof TypingStatus],
+  ): Promise<void> {
     await sendTyping({
       baseUrl: this.tokenData!.baseUrl,
       token: this.tokenData!.token,
       body: {
         ilink_user_id: userId,
         typing_ticket: ticket,
-        status: TypingStatus.CANCEL,
+        status,
       },
     });
   }
 
-  private async sendTypingIndicator(userId: string, contextToken: string): Promise<void> {
-    try {
-      const ticket = await this.getTypingTicket(userId, contextToken);
-      if (!ticket) return;
-
-      await sendTyping({
-        baseUrl: this.tokenData!.baseUrl,
-        token: this.tokenData!.token,
-        body: {
-          ilink_user_id: userId,
-          typing_ticket: ticket,
-          status: TypingStatus.TYPING,
-        },
-      });
-    } catch {
-      // Typing is best-effort
-    }
+  private queueTypingTask(
+    userId: string,
+    task: () => Promise<void>,
+  ): Promise<void> {
+    const previous = this.typingChains.get(userId) ?? Promise.resolve();
+    const current = previous.catch(() => {}).then(task);
+    const stored = current.catch(() => {});
+    this.typingChains.set(userId, stored);
+    void stored.finally(() => {
+      if (this.typingChains.get(userId) === stored) {
+        this.typingChains.delete(userId);
+      }
+    });
+    return current;
   }
 
   private async getTypingTicket(userId: string, contextToken: string): Promise<string | null> {
@@ -1516,6 +1620,15 @@ export class WeChatAcpBridge {
 
   protected messageGenerationForUser(userId: string): number {
     return this.userResetEpochs.get(userId) ?? 0;
+  }
+
+  private requireReplyGeneration(
+    replyGeneration: number | undefined,
+  ): number {
+    if (replyGeneration === undefined) {
+      throw new Error("Agent callback is missing its reset generation");
+    }
+    return replyGeneration;
   }
 
   private extractBridgeCommand(msg: WeixinMessage, canonical: string): string | null {
