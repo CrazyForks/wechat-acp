@@ -10,6 +10,7 @@ class TestBridge extends WeChatAcpBridge {
   readonly enqueued: string[] = [];
   readonly buffered: Array<{ contextToken: string; prompt: ContentBlock[] }> = [];
   readonly sent: Array<{ contextToken: string; segment: string }> = [];
+  private readonly promptGenerations = new Map<string, number>();
   bufferError: Error | undefined;
   sendBehavior: (
     contextToken: string,
@@ -20,6 +21,8 @@ class TestBridge extends WeChatAcpBridge {
     _msg: WeixinMessage,
     _userId: string,
     contextToken: string,
+    _isCurrent: () => boolean = () => true,
+    _replyGeneration?: number,
   ): Promise<void> {
     this.enqueued.push(contextToken);
   }
@@ -28,6 +31,7 @@ class TestBridge extends WeChatAcpBridge {
     _userId: string,
     contextToken: string,
     prompt: ContentBlock[],
+    _replyGeneration?: number,
   ): Promise<void> {
     this.buffered.push({ contextToken, prompt });
     if (this.bufferError) throw this.bufferError;
@@ -44,10 +48,19 @@ class TestBridge extends WeChatAcpBridge {
 
   beginPrompt(contextToken: string): void {
     this.beginAgentPrompt("user", contextToken);
+    this.promptGenerations.set(
+      contextToken,
+      this.messageGenerationForUser("user"),
+    );
   }
 
   queueAgentReply(contextToken: string, text: string): Promise<void> {
-    return this.sendAgentReply("user", contextToken, text);
+    return this.sendAgentReply(
+      "user",
+      contextToken,
+      text,
+      this.promptGenerations.get(contextToken),
+    );
   }
 }
 

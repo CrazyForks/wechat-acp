@@ -47,6 +47,7 @@ function emptyTurnNotice(stopReason: acp.StopReason | undefined): string {
 export interface PendingMessage {
   prompt: acp.ContentBlock[];
   contextToken: string;
+  replyGeneration?: number;
   completion?: {
     resolve: () => void;
     reject: (err: unknown) => void;
@@ -64,6 +65,7 @@ export interface UserSession {
   processing: boolean;
   activeMessage?: PendingMessage;
   closedError?: Error;
+  lifecycleGeneration?: number;
   sessionIdPersisted?: boolean;
   lastActivity: number;
   createdAt: number;
@@ -106,10 +108,30 @@ export interface SessionManagerOpts {
     timeoutMs?: number,
   ) => Promise<void>;
   log: (msg: string) => void;
-  onReply: (userId: string, contextToken: string, text: string) => Promise<void>;
-  onReplyImage?: (userId: string, contextToken: string, image: AgentImage) => Promise<void>;
-  onReplyAudio?: (userId: string, contextToken: string, audio: AgentAudio) => Promise<void>;
-  onReplyFile?: (userId: string, contextToken: string, file: AgentFile) => Promise<void>;
+  onReply: (
+    userId: string,
+    contextToken: string,
+    text: string,
+    replyGeneration?: number,
+  ) => Promise<void>;
+  onReplyImage?: (
+    userId: string,
+    contextToken: string,
+    image: AgentImage,
+    replyGeneration?: number,
+  ) => Promise<void>;
+  onReplyAudio?: (
+    userId: string,
+    contextToken: string,
+    audio: AgentAudio,
+    replyGeneration?: number,
+  ) => Promise<void>;
+  onReplyFile?: (
+    userId: string,
+    contextToken: string,
+    file: AgentFile,
+    replyGeneration?: number,
+  ) => Promise<void>;
   resolveResourceLink?: (link: AgentResourceLink) => Promise<AgentFile | null>;
   sendTyping: (userId: string, contextToken: string) => Promise<void>;
 }
@@ -244,6 +266,8 @@ export class SessionManager {
           userId,
           message.contextToken,
           () => this.isUserGenerationCurrent(userId, generation),
+          generation,
+          message.replyGeneration,
         ));
     } catch (err) {
       if (!this.isUserGenerationCurrent(userId, generation)) {
@@ -257,6 +281,7 @@ export class SessionManager {
           userId,
           message.contextToken,
           `⚠️ Agent session error: ${errorMessage(err)}`,
+          message.replyGeneration,
         );
       } catch (replyErr) {
         this.opts.log(`[${userId}] Failed to send session error: ${String(replyErr)}`);
@@ -453,6 +478,8 @@ export class SessionManager {
     userId: string,
     contextToken: string,
     isCurrent: () => boolean = () => true,
+    lifecycleGeneration = this.userGenerations.get(userId) ?? 0,
+    replyGeneration?: number,
   ): Promise<UserSession> {
     if (!isCurrent()) {
       return Promise.reject(new SessionResetError());
@@ -465,7 +492,13 @@ export class SessionManager {
     if (cleanupOperation) {
       return cleanupOperation.then(() => {
         if (!isCurrent()) throw new SessionResetError();
-        return this.getOrCreateSession(userId, contextToken, isCurrent);
+        return this.getOrCreateSession(
+          userId,
+          contextToken,
+          isCurrent,
+          lifecycleGeneration,
+          replyGeneration,
+        );
       });
     }
     if (this.cleanupStates.has(userId)) {
@@ -484,7 +517,13 @@ export class SessionManager {
         return eviction.then(
           () => {
             if (!isCurrent()) throw new SessionResetError();
-            return this.getOrCreateSession(userId, contextToken, isCurrent);
+            return this.getOrCreateSession(
+              userId,
+              contextToken,
+              isCurrent,
+              lifecycleGeneration,
+              replyGeneration,
+            );
           },
           (err) => {
             if (
@@ -494,7 +533,13 @@ export class SessionManager {
               throw err;
             }
             if (!isCurrent()) throw new SessionResetError();
-            return this.getOrCreateSession(userId, contextToken, isCurrent);
+            return this.getOrCreateSession(
+              userId,
+              contextToken,
+              isCurrent,
+              lifecycleGeneration,
+              replyGeneration,
+            );
           },
         );
       }
@@ -531,6 +576,7 @@ export class SessionManager {
           userId,
           contextToken,
           abortController.signal,
+          replyGeneration,
         );
       } catch (err) {
         if (
@@ -544,6 +590,7 @@ export class SessionManager {
         }
         throw err;
       }
+      created.lifecycleGeneration = lifecycleGeneration;
       if (this.aborted) {
         this.registerSessionCleanup(created, true);
         throw new Error("Session manager stopped while creating a session");
@@ -770,21 +817,48 @@ export class SessionManager {
     userId: string,
     contextToken: string,
     signal: AbortSignal,
+    replyGeneration?: number,
   ): Promise<UserSession> {
     this.opts.log(`Creating new session for ${userId}`);
 
     const client = new WeChatAcpClient({
       sendTyping: () => this.opts.sendTyping(userId, contextToken),
-      onThoughtFlush: (text) => this.opts.onReply(userId, contextToken, text),
-      onMessageFlush: (text) => this.opts.onReply(userId, contextToken, text),
+      onThoughtFlush: (text) =>
+        this.opts.onReply(userId, contextToken, text, replyGeneration),
+      onMessageFlush: (text) =>
+        this.opts.onReply(userId, contextToken, text, replyGeneration),
       ...(this.opts.onReplyImage
-        ? { onImageFlush: (image: AgentImage) => this.opts.onReplyImage!(userId, contextToken, image) }
+        ? {
+            onImageFlush: (image: AgentImage) =>
+              this.opts.onReplyImage!(
+                userId,
+                contextToken,
+                image,
+                replyGeneration,
+              ),
+          }
         : {}),
       ...(this.opts.onReplyAudio
-        ? { onAudioFlush: (audio: AgentAudio) => this.opts.onReplyAudio!(userId, contextToken, audio) }
+        ? {
+            onAudioFlush: (audio: AgentAudio) =>
+              this.opts.onReplyAudio!(
+                userId,
+                contextToken,
+                audio,
+                replyGeneration,
+              ),
+          }
         : {}),
       ...(this.opts.onReplyFile
-        ? { onFileFlush: (file: AgentFile) => this.opts.onReplyFile!(userId, contextToken, file) }
+        ? {
+            onFileFlush: (file: AgentFile) =>
+              this.opts.onReplyFile!(
+                userId,
+                contextToken,
+                file,
+                replyGeneration,
+              ),
+          }
         : {}),
       resolveResourceLink: this.opts.resolveResourceLink,
       onConfigOptionsUpdate: (configOptions) => {
@@ -906,11 +980,21 @@ export class SessionManager {
               ),
             onThoughtFlush: (text) =>
               this.runIfCurrent(session, () =>
-                this.opts.onReply(session.userId, pending.contextToken, text),
+                this.opts.onReply(
+                  session.userId,
+                  pending.contextToken,
+                  text,
+                  pending.replyGeneration,
+                ),
               ),
             onMessageFlush: (text) =>
               this.runIfCurrent(session, () =>
-                this.opts.onReply(session.userId, pending.contextToken, text),
+                this.opts.onReply(
+                  session.userId,
+                  pending.contextToken,
+                  text,
+                  pending.replyGeneration,
+                ),
               ),
             ...(this.opts.onReplyImage
               ? {
@@ -920,6 +1004,7 @@ export class SessionManager {
                         session.userId,
                         pending.contextToken,
                         image,
+                        pending.replyGeneration,
                       ),
                     ),
                 }
@@ -932,6 +1017,7 @@ export class SessionManager {
                         session.userId,
                         pending.contextToken,
                         audio,
+                        pending.replyGeneration,
                       ),
                     ),
                 }
@@ -944,6 +1030,7 @@ export class SessionManager {
                         session.userId,
                         pending.contextToken,
                         file,
+                        pending.replyGeneration,
                       ),
                     ),
                 }
@@ -1002,7 +1089,12 @@ export class SessionManager {
 
           // Send reply back to WeChat
           if (replyText.trim()) {
-            await this.opts.onReply(session.userId, pending.contextToken, replyText);
+            await this.opts.onReply(
+              session.userId,
+              pending.contextToken,
+              replyText,
+              pending.replyGeneration,
+            );
           } else if (!session.client.hasProducedMessage) {
             // The turn ended without the agent ever producing a textual reply
             // (e.g. it stopped after thoughts or a tool call). Surface a minimal
@@ -1014,6 +1106,7 @@ export class SessionManager {
               session.userId,
               pending.contextToken,
               emptyTurnNotice(result.stopReason),
+              pending.replyGeneration,
             );
           }
 
@@ -1028,6 +1121,7 @@ export class SessionManager {
                 session.userId,
                 pending.contextToken,
                 this.opts.turnEndMessage,
+                pending.replyGeneration,
               );
             } catch (err) {
               this.opts.log(
@@ -1088,6 +1182,7 @@ export class SessionManager {
               session.userId,
               pending.contextToken,
               `⚠️ Agent error: ${String(err)}`,
+              pending.replyGeneration,
             );
           } catch {
             // best effort
@@ -1166,6 +1261,15 @@ export class SessionManager {
 
   private isCurrentSession(session: UserSession): boolean {
     if (this.aborted) return false;
+    if (
+      session.lifecycleGeneration !== undefined &&
+      !this.isUserGenerationCurrent(
+        session.userId,
+        session.lifecycleGeneration,
+      )
+    ) {
+      return false;
+    }
     const current = this.sessions.get(session.userId);
     return (
       current === session ||

@@ -94,7 +94,8 @@ export class WeChatAcpBridge {
   // their segments and arrive out of order (issue #38).
   private sendChains = new Map<string, Promise<void>>();
   private messageHandlingChains = new Map<string, Promise<void>>();
-  private messageGenerations = new Map<string, number>();
+  private resetEpoch = 0;
+  private userResetEpochs = new Map<string, number>();
   private pendingText: PendingTextRegistry;
   // Per-user message buffer for /acp-prompt-start.../acp-prompt-done multi-part compose
   private messageBuffers = new Map<string, MessageBuffer>();
@@ -218,10 +219,34 @@ export class WeChatAcpBridge {
           ? () => this.artifactMcpServer!.createLease()
           : undefined,
         log: this.log,
-        onReply: (userId, contextToken, text) => this.sendAgentReply(userId, contextToken, text),
-        onReplyImage: (userId, contextToken, image) => this.sendImageReply(userId, contextToken, image),
-        onReplyAudio: (userId, contextToken, audio) => this.sendAudioReply(userId, contextToken, audio),
-        onReplyFile: (userId, contextToken, file) => this.sendFileReply(userId, contextToken, file),
+        onReply: (userId, contextToken, text, replyGeneration) =>
+          this.sendAgentReply(
+            userId,
+            contextToken,
+            text,
+            replyGeneration,
+          ),
+        onReplyImage: (userId, contextToken, image, replyGeneration) =>
+          this.sendImageReply(
+            userId,
+            contextToken,
+            image,
+            replyGeneration,
+          ),
+        onReplyAudio: (userId, contextToken, audio, replyGeneration) =>
+          this.sendAudioReply(
+            userId,
+            contextToken,
+            audio,
+            replyGeneration,
+          ),
+        onReplyFile: (userId, contextToken, file, replyGeneration) =>
+          this.sendFileReply(
+            userId,
+            contextToken,
+            file,
+            replyGeneration,
+          ),
         resolveResourceLink: this.artifactMcpServer
           ? (link) => this.artifactMcpServer!.resolveResourceLink(link)
           : undefined,
@@ -311,15 +336,15 @@ export class WeChatAcpBridge {
 
     const acpNewCommand = this.extractAcpNewCommand(msg);
     if (acpNewCommand === ACP_NEW_COMMAND) {
-      const generation = (this.messageGenerations.get(userId) ?? 0) + 1;
-      this.messageGenerations.set(userId, generation);
+      const generation = ++this.resetEpoch;
+      this.userResetEpochs.set(userId, generation);
       return this.trackMessageHandling(
         userId,
         this.handleUserMessage(msg, userId, contextToken, generation),
       );
     }
 
-    const generation = this.messageGenerations.get(userId) ?? 0;
+    const generation = this.messageGenerationForUser(userId);
     const previous = this.messageHandlingChains.get(userId) ?? Promise.resolve();
     const current = previous
       .catch(() => {})
@@ -427,6 +452,7 @@ export class WeChatAcpBridge {
             userId,
             contextToken,
             () => this.isMessageGenerationCurrent(userId, generation),
+            generation,
           ),
         )
       : this.enqueueMessage(
@@ -434,6 +460,7 @@ export class WeChatAcpBridge {
           userId,
           contextToken,
           () => this.isMessageGenerationCurrent(userId, generation),
+          generation,
         ));
   }
 
@@ -442,6 +469,7 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
     isCurrent: () => boolean = () => true,
+    replyGeneration?: number,
   ): Promise<void> {
     const prompt = await weixinMessageToPrompt(
       msg,
@@ -451,7 +479,11 @@ export class WeChatAcpBridge {
     );
 
     if (!isCurrent()) return;
-    await this.sessionManager!.enqueue(userId, { prompt, contextToken });
+    await this.sessionManager!.enqueue(userId, {
+      prompt,
+      contextToken,
+      replyGeneration,
+    });
   }
 
   protected async resetUserSession(
@@ -554,10 +586,10 @@ export class WeChatAcpBridge {
       throw new Error("Bridge is not ready to process injected messages");
     }
 
-    const admittedGenerations = new Map(this.messageGenerations);
+    const admittedResetEpoch = this.resetEpoch;
     const target = await this.resolveInjectedTarget(job);
-    const generation = admittedGenerations.get(target.userId) ?? 0;
-    if (!this.isMessageGenerationCurrent(target.userId, generation)) {
+    const generation = this.messageGenerationForUser(target.userId);
+    if (generation > admittedResetEpoch) {
       throw new Error(
         `Injected message ${job.id} was discarded because the target ACP session was reset`,
       );
@@ -576,6 +608,7 @@ export class WeChatAcpBridge {
     await this.sessionManager.enqueueAndWait(target.userId, {
       prompt,
       contextToken: target.contextToken,
+      replyGeneration: generation,
     });
   }
 
@@ -842,6 +875,7 @@ export class WeChatAcpBridge {
       buffer,
       pending,
       () => this.isMessageGenerationCurrent(userId, generation),
+      generation,
     );
     this.bufferFlushing.set(userId, flushPromise);
     void flushPromise.finally(() => {
@@ -859,6 +893,7 @@ export class WeChatAcpBridge {
     buffer: MessageBuffer,
     pending: Promise<void>,
     isCurrent: () => boolean,
+    replyGeneration: number,
   ): Promise<void> {
     // Wait for any in-flight appends to finish before reading
     try {
@@ -896,15 +931,25 @@ export class WeChatAcpBridge {
     );
 
     if (!isCurrent()) return;
-    await this.enqueueBufferedPrompt(userId, contextToken, buffer.blocks);
+    await this.enqueueBufferedPrompt(
+      userId,
+      contextToken,
+      buffer.blocks,
+      replyGeneration,
+    );
   }
 
   protected async enqueueBufferedPrompt(
     userId: string,
     contextToken: string,
     prompt: acp.ContentBlock[],
+    replyGeneration?: number,
   ): Promise<void> {
-    await this.sessionManager!.enqueue(userId, { prompt, contextToken });
+    await this.sessionManager!.enqueue(userId, {
+      prompt,
+      contextToken,
+      replyGeneration,
+    });
   }
 
   private appendToBuffer(
@@ -1000,7 +1045,7 @@ export class WeChatAcpBridge {
     // that segments from separate sendReply calls cannot interleave (issue #38).
     // The stored link swallows errors so one failed reply doesn't break the
     // chain for the next caller, while the returned promise still propagates.
-    const generation = this.messageGenerations.get(userId) ?? 0;
+    const generation = this.messageGenerationForUser(userId);
     const isCurrent = () =>
       this.isMessageGenerationCurrent(userId, generation);
     return this.queueSendTask(userId, () => {
@@ -1023,9 +1068,11 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
     text: string,
+    replyGeneration?: number,
   ): Promise<void> {
+    if (replyGeneration === undefined) return;
     const generation = this.pendingText.generationForContext(userId, contextToken);
-    return this.queueAgentSendTask(userId, (isCurrent) =>
+    return this.queueAgentSendTask(userId, replyGeneration, (isCurrent) =>
       this.deliverReply(
         userId,
         contextToken,
@@ -1038,9 +1085,9 @@ export class WeChatAcpBridge {
 
   private queueAgentSendTask(
     userId: string,
+    generation: number,
     task: (isCurrent: () => boolean) => Promise<void>,
   ): Promise<void> {
-    const generation = this.messageGenerations.get(userId) ?? 0;
     const isCurrent = () =>
       this.isMessageGenerationCurrent(userId, generation);
     return this.queueSendTask(userId, () => {
@@ -1150,10 +1197,16 @@ export class WeChatAcpBridge {
     return false;
   }
 
-  private async sendImageReply(userId: string, contextToken: string, image: AgentImage): Promise<void> {
+  private async sendImageReply(
+    userId: string,
+    contextToken: string,
+    image: AgentImage,
+    replyGeneration?: number,
+  ): Promise<void> {
+    if (replyGeneration === undefined) return;
     // Ride the same per-user chain as text replies so an image cannot
     // interleave with the segments of a concurrent text reply.
-    return this.queueAgentSendTask(userId, (isCurrent) =>
+    return this.queueAgentSendTask(userId, replyGeneration, (isCurrent) =>
       this.deliverImage(userId, contextToken, image, isCurrent),
     );
   }
@@ -1220,7 +1273,12 @@ export class WeChatAcpBridge {
       : new Error(`deliverImage: failed after ${SEGMENT_SEND_MAX_ATTEMPTS} attempts`);
   }
 
-  private async sendAudioReply(userId: string, contextToken: string, audio: AgentAudio): Promise<void> {
+  private async sendAudioReply(
+    userId: string,
+    contextToken: string,
+    audio: AgentAudio,
+    replyGeneration?: number,
+  ): Promise<void> {
     const mime = audio.mimeType.trim().toLowerCase();
     const ext = Object.hasOwn(AUDIO_MIME_EXTENSIONS, mime) ? AUDIO_MIME_EXTENSIONS[mime] : "bin";
     const fileName = `audio-${new Date().toISOString().replace(/[:.]/g, "-")}.${ext}`;
@@ -1229,6 +1287,7 @@ export class WeChatAcpBridge {
       contextToken,
       { data: audio.data, name: fileName, mimeType: audio.mimeType },
       "audio",
+      replyGeneration,
     );
   }
 
@@ -1236,8 +1295,15 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
     file: AgentFile,
+    replyGeneration?: number,
   ): Promise<void> {
-    return this.queueFileReply(userId, contextToken, file, "file");
+    return this.queueFileReply(
+      userId,
+      contextToken,
+      file,
+      "file",
+      replyGeneration,
+    );
   }
 
   private async queueFileReply(
@@ -1245,10 +1311,12 @@ export class WeChatAcpBridge {
     contextToken: string,
     file: AgentFile,
     telemetryKind: "audio" | "file",
+    replyGeneration?: number,
   ): Promise<void> {
+    if (replyGeneration === undefined) return;
     // Ride the same per-user chain as text and image replies so a file cannot
     // interleave with the segments of a concurrent reply.
-    return this.queueAgentSendTask(userId, (isCurrent) =>
+    return this.queueAgentSendTask(userId, replyGeneration, (isCurrent) =>
       this.deliverFile(
         userId,
         contextToken,
@@ -1443,7 +1511,11 @@ export class WeChatAcpBridge {
     userId: string,
     generation: number,
   ): boolean {
-    return (this.messageGenerations.get(userId) ?? 0) === generation;
+    return this.messageGenerationForUser(userId) === generation;
+  }
+
+  protected messageGenerationForUser(userId: string): number {
+    return this.userResetEpochs.get(userId) ?? 0;
   }
 
   private extractBridgeCommand(msg: WeixinMessage, canonical: string): string | null {

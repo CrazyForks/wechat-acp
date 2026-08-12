@@ -14,6 +14,7 @@ class TestBridge extends WeChatAcpBridge {
   readonly resetUsers: string[] = [];
   readonly sent: Array<{ contextToken: string; segment: string }> = [];
   readonly events: string[] = [];
+  private readonly promptGenerations = new Map<string, number>();
   enqueueGate: Promise<void> | undefined;
   sendBehavior: (
     contextToken: string,
@@ -39,6 +40,7 @@ class TestBridge extends WeChatAcpBridge {
     _userId: string,
     contextToken: string,
     isCurrent: () => boolean = () => true,
+    _replyGeneration?: number,
   ): Promise<void> {
     this.events.push(`enqueue-start:${contextToken}`);
     await this.enqueueGate;
@@ -62,6 +64,7 @@ class TestBridge extends WeChatAcpBridge {
     _userId: string,
     contextToken: string,
     prompt: ContentBlock[],
+    _replyGeneration?: number,
   ): Promise<void> {
     this.buffered.push({ contextToken, prompt });
   }
@@ -83,10 +86,19 @@ class TestBridge extends WeChatAcpBridge {
 
   beginPrompt(contextToken: string): void {
     this.beginAgentPrompt("user", contextToken);
+    this.promptGenerations.set(
+      contextToken,
+      this.messageGenerationForUser("user"),
+    );
   }
 
   queueAgentReply(contextToken: string, text: string): Promise<void> {
-    return this.sendAgentReply("user", contextToken, text);
+    return this.sendAgentReply(
+      "user",
+      contextToken,
+      text,
+      this.promptGenerations.get(contextToken),
+    );
   }
 }
 
@@ -384,6 +396,21 @@ test("a queued old agent reply is discarded at the reset boundary", async () => 
   );
   assert.ok(
     bridge.sent.some(({ segment }) => segment.includes("ACP session cleared")),
+  );
+});
+
+test("a late old agent callback cannot adopt the reset generation", async () => {
+  const bridge = makeBridge();
+  bridge.beginPrompt("context-old");
+
+  await bridge.handleMessage(
+    textMessage(BRIDGE_COMMANDS.acpNew, "context-reset"),
+  );
+  await bridge.queueAgentReply("context-old", "LATE OLD REPLY");
+
+  assert.equal(
+    bridge.sent.some(({ segment }) => segment === "LATE OLD REPLY"),
+    false,
   );
 });
 

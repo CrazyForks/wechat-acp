@@ -363,6 +363,39 @@ test("reset rejects every prompt queued before the reset boundary", async () => 
   assert.equal(manager.getSession("target"), undefined);
 });
 
+test("reset invalidates callbacks before lifecycle cleanup starts", async () => {
+  const manager = makeManager();
+  const session = makeSession("target", {
+    process: makeProcess([]),
+  });
+  session.lifecycleGeneration = 0;
+  let releaseLifecycle!: () => void;
+  const priorLifecycle = new Promise<void>((resolve) => {
+    releaseLifecycle = resolve;
+  });
+  const internal = manager as unknown as {
+    sessions: Map<string, UserSession>;
+    userLifecycleChains: Map<string, Promise<void>>;
+    runIfCurrent(
+      session: UserSession,
+      task: () => Promise<void>,
+    ): Promise<void>;
+  };
+  internal.sessions.set("target", session);
+  internal.userLifecycleChains.set("target", priorLifecycle);
+  let callbackRan = false;
+
+  const reset = manager.resetSession("target");
+  await internal.runIfCurrent(session, async () => {
+    callbackRan = true;
+  });
+
+  assert.equal(callbackRan, false);
+  assert.equal(manager.getSession("target"), session);
+  releaseLifecycle();
+  await reset;
+});
+
 test("reset reports a pending creation lease cleanup failure", async () => {
   const manager = makeManager();
   let creationStarted!: () => void;
