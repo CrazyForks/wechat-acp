@@ -5,6 +5,7 @@ import type { ContentBlock } from "@agentclientprotocol/sdk";
 import { WeChatAcpBridge } from "../src/bridge.js";
 import type { ResetSessionResult } from "../src/acp/session.js";
 import { BRIDGE_COMMANDS, defaultConfig } from "../src/config.js";
+import type { InjectedMessage } from "../src/inject/types.js";
 import { MessageType, type WeixinMessage } from "../src/weixin/types.js";
 
 class TestBridge extends WeChatAcpBridge {
@@ -26,6 +27,12 @@ class TestBridge extends WeChatAcpBridge {
   };
   resetBehavior: (userId: string) => Promise<ResetSessionResult> = async () =>
     this.resetResult;
+  injectionTargetBehavior: (
+    job: InjectedMessage,
+  ) => Promise<{ userId: string; contextToken: string }> = async (job) => ({
+    userId: job.target,
+    contextToken: job.contextToken ?? "injected-context",
+  });
 
   protected override async enqueueMessage(
     _msg: WeixinMessage,
@@ -66,6 +73,12 @@ class TestBridge extends WeChatAcpBridge {
   ): Promise<boolean> {
     this.sent.push({ contextToken, segment });
     return this.sendBehavior(contextToken, segment);
+  }
+
+  protected override resolveInjectedTarget(
+    job: InjectedMessage,
+  ): Promise<{ userId: string; contextToken: string }> {
+    return this.injectionTargetBehavior(job);
   }
 
   beginPrompt(contextToken: string): void {
@@ -446,4 +459,54 @@ test("acp-new discards acp-more queued behind an in-flight reply", async () => {
     bridge.sent.some(({ contextToken }) => contextToken === "context-more"),
     false,
   );
+});
+
+test("acp-new discards an injection admitted before target resolution", async () => {
+  const bridge = makeBridge();
+  let resolutionStarted!: () => void;
+  const started = new Promise<void>((resolve) => {
+    resolutionStarted = resolve;
+  });
+  let finishResolution!: () => void;
+  const resolution = new Promise<void>((resolve) => {
+    finishResolution = resolve;
+  });
+  bridge.injectionTargetBehavior = async () => {
+    resolutionStarted();
+    await resolution;
+    return { userId: "user", contextToken: "context-injected" };
+  };
+  const injected: string[] = [];
+  const internal = bridge as unknown as {
+    config: { storage: { stateFile?: string } };
+    sessionManager: {
+      enqueueAndWait(
+        userId: string,
+        message: { contextToken: string },
+      ): Promise<void>;
+    };
+    enqueueInjectedMessage(job: InjectedMessage): Promise<void>;
+  };
+  internal.config.storage.stateFile = "state.json";
+  internal.sessionManager = {
+    enqueueAndWait: async (_userId, message) => {
+      injected.push(message.contextToken);
+    },
+  };
+  const injection = internal.enqueueInjectedMessage({
+    id: "injection-before-reset",
+    createdAt: new Date().toISOString(),
+    target: "last-active-user",
+    text: "old injected prompt",
+    source: "cli",
+  });
+  await started;
+
+  await bridge.handleMessage(
+    textMessage(BRIDGE_COMMANDS.acpNew, "context-reset"),
+  );
+  finishResolution();
+
+  await assert.rejects(injection, /discarded because the target ACP session was reset/);
+  assert.deepEqual(injected, []);
 });

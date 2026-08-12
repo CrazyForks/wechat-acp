@@ -72,6 +72,7 @@ export async function spawnAgent(params: {
     cwd,
     env: { ...process.env, ...env },
     shell: useShell,
+    detached: !useShell,
     windowsHide: true,
   });
 
@@ -222,6 +223,24 @@ export async function spawnAgent(params: {
 }
 
 export function killAgent(proc: ChildProcess): void {
+  if (process.platform !== "win32" && proc.pid !== undefined) {
+    const groupPid = proc.pid;
+    try {
+      if (!signalPosixProcessGroup(groupPid, "SIGTERM")) return;
+      setTimeout(() => {
+        try {
+          if (isPosixProcessGroupRunning(groupPid)) {
+            signalPosixProcessGroup(groupPid, "SIGKILL");
+          }
+        } catch {
+          proc.kill("SIGKILL");
+        }
+      }, 5_000).unref();
+      return;
+    } catch {
+      // Fall back to the direct child when the process is not a group leader.
+    }
+  }
   if (proc.exitCode === null && proc.signalCode === null) {
     proc.kill("SIGTERM");
     // Force kill after 5s if still alive
@@ -239,11 +258,12 @@ export async function killAgentAndWait(
   options: {
     platform?: NodeJS.Platform;
     killWindowsProcessTree?: (pid: number, timeoutMs: number) => Promise<void>;
+    killPosixProcessGroup?: (pid: number, timeoutMs: number) => Promise<void>;
   } = {},
 ): Promise<void> {
-  if (proc.exitCode !== null || proc.signalCode !== null) return;
-
-  if ((options.platform ?? process.platform) === "win32") {
+  const platform = options.platform ?? process.platform;
+  if (platform === "win32") {
+    if (proc.exitCode !== null || proc.signalCode !== null) return;
     if (proc.pid === undefined) {
       throw new Error("Cannot stop agent process tree without a process ID");
     }
@@ -258,6 +278,14 @@ export async function killAgentAndWait(
     }
     return;
   }
+
+  if (proc.pid !== undefined) {
+    await (
+      options.killPosixProcessGroup ?? killPosixProcessGroup
+    )(proc.pid, timeoutMs);
+    return;
+  }
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
 
   let settle!: () => void;
   const exited = new Promise<void>((resolve) => {
@@ -288,6 +316,63 @@ export async function killAgentAndWait(
     proc.off("exit", settle);
     proc.off("close", settle);
   }
+}
+
+async function killPosixProcessGroup(
+  pid: number,
+  timeoutMs: number,
+): Promise<void> {
+  if (!signalPosixProcessGroup(pid, "SIGTERM")) return;
+  const startedAt = Date.now();
+  const forceAfterMs = Math.min(5_000, Math.max(0, timeoutMs - 100));
+  let forceSent = false;
+
+  while (isPosixProcessGroupRunning(pid)) {
+    const elapsed = Date.now() - startedAt;
+    if (!forceSent && elapsed >= forceAfterMs) {
+      if (!signalPosixProcessGroup(pid, "SIGKILL")) return;
+      forceSent = true;
+    }
+    if (elapsed >= timeoutMs) {
+      throw new Error(
+        `Agent process group ${pid} did not exit within ${timeoutMs}ms`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
+function signalPosixProcessGroup(
+  pid: number,
+  signal: NodeJS.Signals,
+): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch (err) {
+    if (hasErrorCode(err, "ESRCH")) return false;
+    throw err;
+  }
+}
+
+function isPosixProcessGroupRunning(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (err) {
+    if (hasErrorCode(err, "ESRCH")) return false;
+    if (hasErrorCode(err, "EPERM")) return true;
+    throw err;
+  }
+}
+
+function hasErrorCode(err: unknown, code: string): boolean {
+  return (
+    typeof err === "object" &&
+    err !== null &&
+    "code" in err &&
+    err.code === code
+  );
 }
 
 async function killWindowsProcessTree(

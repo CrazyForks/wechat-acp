@@ -554,7 +554,14 @@ export class WeChatAcpBridge {
       throw new Error("Bridge is not ready to process injected messages");
     }
 
-    const target = await resolveUserTarget(this.config.storage.stateFile, job.target, job.contextToken);
+    const admittedGenerations = new Map(this.messageGenerations);
+    const target = await this.resolveInjectedTarget(job);
+    const generation = admittedGenerations.get(target.userId) ?? 0;
+    if (!this.isMessageGenerationCurrent(target.userId, generation)) {
+      throw new Error(
+        `Injected message ${job.id} was discarded because the target ACP session was reset`,
+      );
+    }
     this.beginAgentPrompt(target.userId, target.contextToken);
     const prompt: acp.ContentBlock[] = [{ type: "text", text: job.text }];
     this.log(`[inject] enqueue ${job.id} for ${target.userId}`);
@@ -570,6 +577,17 @@ export class WeChatAcpBridge {
       prompt,
       contextToken: target.contextToken,
     });
+  }
+
+  protected resolveInjectedTarget(job: InjectedMessage): Promise<{
+    userId: string;
+    contextToken: string;
+  }> {
+    return resolveUserTarget(
+      this.config.storage.stateFile!,
+      job.target,
+      job.contextToken,
+    );
   }
 
   private async handleAcpConfigCommand(

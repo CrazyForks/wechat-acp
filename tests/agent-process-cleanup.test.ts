@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn, type ChildProcess } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -70,6 +70,26 @@ test("Windows cleanup accepts taskkill losing a race with wrapper exit", async (
   });
 });
 
+test("POSIX cleanup targets the process group after wrapper exit", async () => {
+  const state = { exitCode: 0 as number | null };
+  const proc = new EventEmitter() as ChildProcess;
+  Object.defineProperties(proc, {
+    pid: { value: 4242 },
+    exitCode: { get: () => state.exitCode },
+    signalCode: { value: null },
+  });
+  const calls: Array<{ pid: number; timeoutMs: number }> = [];
+
+  await killAgentAndWait(proc, 1234, {
+    platform: "linux",
+    killPosixProcessGroup: async (pid, timeoutMs) => {
+      calls.push({ pid, timeoutMs });
+    },
+  });
+
+  assert.deepEqual(calls, [{ pid: 4242, timeoutMs: 1234 }]);
+});
+
 test(
   "Windows cleanup terminates a real shell process tree",
   { skip: process.platform !== "win32" },
@@ -94,6 +114,52 @@ test(
       assert.notEqual(agentPid, wrapper.pid);
 
       await killAgentAndWait(wrapper, 5_000);
+      await waitForExit(agentPid);
+      assert.equal(isProcessRunning(agentPid), false);
+    } finally {
+      if (agentPid !== undefined && isProcessRunning(agentPid)) {
+        process.kill(agentPid, "SIGKILL");
+      }
+      if (wrapper.exitCode === null && wrapper.signalCode === null) {
+        wrapper.kill("SIGKILL");
+      }
+      await fs.rm(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "POSIX cleanup terminates descendants after the wrapper exits",
+  { skip: process.platform === "win32" },
+  async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "wechat-acp-group-"));
+    const scriptPath = path.join(dir, "wrapper.cjs");
+    const pidPath = path.join(dir, "agent.pid");
+    await fs.writeFile(
+      scriptPath,
+      [
+        'const { spawn } = require("node:child_process");',
+        'const fs = require("node:fs");',
+        'const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+        'fs.writeFileSync(process.argv[2], String(child.pid));',
+        "child.unref();",
+      ].join("\n"),
+    );
+    const wrapper = spawn(process.execPath, [scriptPath, pidPath], {
+      detached: true,
+      stdio: "ignore",
+    });
+    let agentPid: number | undefined;
+
+    try {
+      agentPid = Number(await waitForFile(pidPath));
+      assert.equal(Number.isInteger(agentPid), true);
+      if (wrapper.exitCode === null) {
+        await once(wrapper, "exit");
+      }
+      assert.equal(isProcessRunning(agentPid), true);
+
+      await killAgentAndWait(wrapper, 2_000);
       await waitForExit(agentPid);
       assert.equal(isProcessRunning(agentPid), false);
     } finally {
