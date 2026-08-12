@@ -753,6 +753,45 @@ test("natural wrapper exit retains process-group cleanup for retry", async () =>
   assert.equal(processCleanupCalls, 2);
 });
 
+test("natural wrapper exit rejects the active completion immediately", async () => {
+  const process = new EventEmitter() as ChildProcess;
+  Object.defineProperties(process, {
+    pid: { value: 4242 },
+    exitCode: { value: 0 },
+    signalCode: { value: null },
+  });
+  const manager = makeManager({
+    killAgentProcess: async () => {},
+  });
+  let rejectCompletion!: (err: unknown) => void;
+  const completion = new Promise<void>((_resolve, reject) => {
+    rejectCompletion = reject;
+  });
+  const session = makeSession("target", {
+    process,
+    processing: true,
+  });
+  session.activeMessage = {
+    prompt: [],
+    contextToken: "context",
+    completion: {
+      resolve: () => {},
+      reject: rejectCompletion,
+    },
+  };
+  const internal = manager as unknown as {
+    sessions: Map<string, UserSession>;
+    handleAgentExit(userId: string, process: ChildProcess): void;
+  };
+  internal.sessions.set("target", session);
+  const rejected = assert.rejects(completion, /Agent process exited/);
+
+  internal.handleAgentExit("target", process);
+
+  await rejected;
+  assert.equal(session.activeMessage.completion, undefined);
+});
+
 test("session creation rejects a process that already exited", async () => {
   const process = new EventEmitter() as ChildProcess;
   Object.defineProperties(process, {

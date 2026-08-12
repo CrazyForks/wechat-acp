@@ -210,11 +210,7 @@ export class SessionManager {
       session.closedError = new Error(
         "Session stopped before queued message was processed",
       );
-      if (session.activeMessage?.completion) {
-        session.activeMessage.completion.reject(session.closedError);
-        session.activeMessage.completion = undefined;
-      }
-      this.rejectQueuedCompletions(session, session.closedError);
+      this.rejectSessionCompletions(session, session.closedError);
       const cleanupState = this.getOrCreateCleanupState(userId);
       cleanupState.processes.add(session.agentInfo.process);
       if (session.mcpLease) {
@@ -435,11 +431,7 @@ export class SessionManager {
         session.closedError = resetError;
         cancelledTurn = session.processing;
         droppedQueueCount = session.queue.length;
-        if (session.activeMessage?.completion) {
-          session.activeMessage.completion.reject(resetError);
-          session.activeMessage.completion = undefined;
-        }
-        this.rejectQueuedCompletions(session, resetError);
+        this.rejectSessionCompletions(session, resetError);
         this.sessions.delete(userId);
         const cleanupState = this.getOrCreateCleanupState(userId);
         cleanupState.processes.add(session.agentInfo.process);
@@ -952,7 +944,7 @@ export class SessionManager {
     session.closedError = new Error(
       "Agent process exited before queued message was processed",
     );
-    this.rejectQueuedCompletions(session, session.closedError);
+    this.rejectSessionCompletions(session, session.closedError);
     this.registerSessionCleanup(session, true);
     this.sessions.delete(userId);
     this.retryCleanupInBackground(userId, "Agent exit");
@@ -1156,7 +1148,7 @@ export class SessionManager {
             this.opts.log(`[${session.userId}] Agent process died, removing session`);
             session.closedError =
               err instanceof Error ? err : new Error(String(err));
-            this.rejectQueuedCompletions(session, err);
+            this.rejectSessionCompletions(session, err);
             if (this.sessions.get(session.userId) === session) {
               this.registerSessionCleanup(session, true);
               this.sessions.delete(session.userId);
@@ -1218,7 +1210,7 @@ export class SessionManager {
         session.closedError = new Error(
           "Session expired before queued message was processed",
         );
-        this.rejectQueuedCompletions(session, session.closedError);
+        this.rejectSessionCompletions(session, session.closedError);
         this.registerSessionCleanup(session, true);
         this.sessions.delete(userId);
         this.retryCleanupInBackground(userId, "Idle session");
@@ -1244,7 +1236,7 @@ export class SessionManager {
         session.closedError = new Error(
           "Session evicted before queued message was processed",
         );
-        this.rejectQueuedCompletions(session, session.closedError);
+        this.rejectSessionCompletions(session, session.closedError);
         this.registerSessionCleanup(session, true);
         this.sessions.delete(oldest.userId);
         return this.retryCleanupState(oldest.userId);
@@ -1253,7 +1245,11 @@ export class SessionManager {
     return undefined;
   }
 
-  private rejectQueuedCompletions(session: UserSession, err: unknown): void {
+  private rejectSessionCompletions(session: UserSession, err: unknown): void {
+    if (session.activeMessage?.completion) {
+      session.activeMessage.completion.reject(err);
+      session.activeMessage.completion = undefined;
+    }
     for (const pending of session.queue.splice(0)) {
       pending.completion?.reject(err);
     }
