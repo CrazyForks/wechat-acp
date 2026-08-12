@@ -29,6 +29,12 @@ export interface ArtifactMcpServer {
   close(): Promise<void>;
 }
 
+interface ArtifactLeaseState {
+  sessionIds: Set<string>;
+  inFlightInitializations: Set<Promise<void>>;
+  closing: boolean;
+}
+
 export async function startArtifactMcpServer(options: {
   rootDir: string;
   log: (message: string) => void;
@@ -42,7 +48,7 @@ export async function startArtifactMcpServer(options: {
       leaseToken: string;
     }
   >();
-  const leases = new Map<string, Set<string>>();
+  const leases = new Map<string, ArtifactLeaseState>();
 
   const app = createMcpExpressApp({ host: "127.0.0.1" });
   app.use(
@@ -64,56 +70,82 @@ export async function startArtifactMcpServer(options: {
 
   app.all(MCP_PATH, async (req: Request, res: Response) => {
     const leaseToken = res.locals.artifactLeaseToken as string;
-    const leaseSessions = leases.get(leaseToken);
-    if (!leaseSessions) {
+    const lease = leases.get(leaseToken);
+    if (!lease || lease.closing) {
       res.status(401).json({ error: "Unauthorized" });
       return;
     }
-    const sessionIdHeader = req.headers["mcp-session-id"];
-    const sessionId =
-      typeof sessionIdHeader === "string" ? sessionIdHeader : undefined;
-    let session = sessionId ? sessions.get(sessionId) : undefined;
-    let isNewSession = false;
-    if (session && session.leaseToken !== leaseToken) {
-      session = undefined;
-    }
 
-    if (!session) {
-      if (
-        req.method !== "POST" ||
-        typeof req.body !== "object" ||
-        req.body === null ||
-        req.body.method !== "initialize"
-      ) {
-        res.status(sessionId ? 404 : 400).json({
-          error: sessionId ? "Unknown MCP session" : "Missing MCP initialization",
-        });
-        return;
-      }
-      const created = await createMcpSession(store, options.log);
-      session = { ...created, leaseToken };
-      isNewSession = true;
-    }
-
+    let finishInitialization: (() => void) | undefined;
+    let initializationFinished: Promise<void> | undefined;
     try {
-      await session.transport.handleRequest(req, res, req.body);
-      if (isNewSession) {
-        const newSessionId = session.transport.sessionId;
-        if (!newSessionId) {
-          throw new Error("MCP transport did not create a session ID");
-        }
-        sessions.set(newSessionId, session);
-        leaseSessions.add(newSessionId);
-      } else if (req.method === "DELETE" && sessionId) {
-        sessions.delete(sessionId);
-        leaseSessions.delete(sessionId);
-        await session.mcp.close();
+      const sessionIdHeader = req.headers["mcp-session-id"];
+      const sessionId =
+        typeof sessionIdHeader === "string" ? sessionIdHeader : undefined;
+      let session = sessionId ? sessions.get(sessionId) : undefined;
+      let isNewSession = false;
+      if (session && session.leaseToken !== leaseToken) {
+        session = undefined;
       }
-    } catch (err) {
-      options.log(`[artifact-mcp] request failed: ${String(err)}`);
-      if (isNewSession) await session.mcp.close();
-      if (!res.headersSent) {
-        res.status(500).json({ error: "MCP request failed" });
+
+      if (!session) {
+        if (
+          req.method !== "POST" ||
+          typeof req.body !== "object" ||
+          req.body === null ||
+          req.body.method !== "initialize"
+        ) {
+          res.status(sessionId ? 404 : 400).json({
+            error: sessionId ? "Unknown MCP session" : "Missing MCP initialization",
+          });
+          return;
+        }
+        initializationFinished = new Promise<void>((resolve) => {
+          finishInitialization = resolve;
+        });
+        lease.inFlightInitializations.add(initializationFinished);
+        const created = await createMcpSession(store, options.log);
+        session = { ...created, leaseToken };
+        isNewSession = true;
+      }
+
+      try {
+        await session.transport.handleRequest(req, res, req.body);
+        if (isNewSession) {
+          const newSessionId = session.transport.sessionId;
+          if (!newSessionId) {
+            throw new Error("MCP transport did not create a session ID");
+          }
+          sessions.set(newSessionId, session);
+          lease.sessionIds.add(newSessionId);
+        } else if (req.method === "DELETE" && sessionId) {
+          await session.mcp.close();
+          sessions.delete(sessionId);
+          lease.sessionIds.delete(sessionId);
+        }
+      } catch (err) {
+        options.log(`[artifact-mcp] request failed: ${String(err)}`);
+        if (isNewSession) {
+          try {
+            await session.mcp.close();
+          } catch (cleanupErr) {
+            const cleanupSessionId =
+              session.transport.sessionId ?? `failed-${randomUUID()}`;
+            sessions.set(cleanupSessionId, session);
+            lease.sessionIds.add(cleanupSessionId);
+            options.log(
+              `[artifact-mcp] deferred failed session cleanup: ${String(cleanupErr)}`,
+            );
+          }
+        }
+        if (!res.headersSent) {
+          res.status(500).json({ error: "MCP request failed" });
+        }
+      }
+    } finally {
+      if (initializationFinished) {
+        lease.inFlightInitializations.delete(initializationFinished);
+        finishInitialization!();
       }
     }
   });
@@ -126,8 +158,12 @@ export async function startArtifactMcpServer(options: {
   return {
     createLease: () => {
       const token = randomBytes(32).toString("base64url");
-      const leaseSessions = new Set<string>();
-      leases.set(token, leaseSessions);
+      const lease: ArtifactLeaseState = {
+        sessionIds: new Set(),
+        inFlightInitializations: new Set(),
+        closing: false,
+      };
+      leases.set(token, lease);
       let closed = false;
       let closing: Promise<void> | undefined;
       return {
@@ -142,7 +178,7 @@ export async function startArtifactMcpServer(options: {
           if (closing) return closing;
           const attempt = closeLease(
             token,
-            leaseSessions,
+            lease,
             leases,
             sessions,
           );
@@ -192,8 +228,8 @@ export async function startArtifactMcpServer(options: {
 
 export async function closeLease(
   token: string,
-  sessionIds: Set<string>,
-  leases: Map<string, Set<string>>,
+  lease: ArtifactLeaseState,
+  leases: Map<string, ArtifactLeaseState>,
   sessions: Map<
     string,
     {
@@ -203,7 +239,10 @@ export async function closeLease(
     }
   >,
 ): Promise<void> {
+  lease.closing = true;
   leases.delete(token);
+  await Promise.all([...lease.inFlightInitializations]);
+  const sessionIds = lease.sessionIds;
   const closing: Array<{
     sessionId: string;
     session: {
