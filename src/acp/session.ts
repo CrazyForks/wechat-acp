@@ -102,6 +102,10 @@ export interface SessionManagerOpts {
   showResources?: boolean;
   createMcpLease?: () => SessionMcpLease;
   agentShutdownTimeoutMs?: number;
+  killAgentProcess?: (
+    process: ChildProcess,
+    timeoutMs?: number,
+  ) => Promise<void>;
   log: (msg: string) => void;
   onReply: (userId: string, contextToken: string, text: string) => Promise<void>;
   onReplyImage?: (userId: string, contextToken: string, image: AgentImage) => Promise<void>;
@@ -607,7 +611,10 @@ export class SessionManager {
     for (const process of state.processes) {
       operations.push({
         run: () =>
-          killAgentAndWait(process, this.opts.agentShutdownTimeoutMs),
+          (this.opts.killAgentProcess ?? killAgentAndWait)(
+            process,
+            this.opts.agentShutdownTimeoutMs,
+          ),
         complete: () => {
           state.processes.delete(process);
         },

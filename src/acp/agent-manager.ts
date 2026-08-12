@@ -83,8 +83,6 @@ export async function spawnAgent(params: {
   proc.on("exit", (code, signal) => {
     log(`Agent process exited: code=${code} signal=${signal}`);
   });
-  const abortSpawn = () => killAgent(proc);
-  signal?.addEventListener("abort", abortSpawn, { once: true });
 
   try {
     if (!proc.stdin || !proc.stdout) {
@@ -198,8 +196,6 @@ export async function spawnAgent(params: {
       throw new AgentProcessCleanupError(err, cleanupErr, proc);
     }
     throw err;
-  } finally {
-    signal?.removeEventListener("abort", abortSpawn);
   }
 
   function isResourceNotFound(err: unknown): boolean {
@@ -240,8 +236,28 @@ export function killAgent(proc: ChildProcess): void {
 export async function killAgentAndWait(
   proc: ChildProcess,
   timeoutMs = 6_000,
+  options: {
+    platform?: NodeJS.Platform;
+    killWindowsProcessTree?: (pid: number, timeoutMs: number) => Promise<void>;
+  } = {},
 ): Promise<void> {
   if (proc.exitCode !== null || proc.signalCode !== null) return;
+
+  if ((options.platform ?? process.platform) === "win32") {
+    if (proc.pid === undefined) {
+      throw new Error("Cannot stop agent process tree without a process ID");
+    }
+    try {
+      await (
+        options.killWindowsProcessTree ?? killWindowsProcessTree
+      )(proc.pid, timeoutMs);
+    } catch (err) {
+      if (proc.exitCode === null && proc.signalCode === null) {
+        throw err;
+      }
+    }
+    return;
+  }
 
   let settle!: () => void;
   const exited = new Promise<void>((resolve) => {
@@ -272,6 +288,66 @@ export async function killAgentAndWait(
     proc.off("exit", settle);
     proc.off("close", settle);
   }
+}
+
+async function killWindowsProcessTree(
+  pid: number,
+  timeoutMs: number,
+): Promise<void> {
+  const taskkill = spawn(
+    "taskkill.exe",
+    ["/PID", String(pid), "/T", "/F"],
+    {
+      stdio: ["ignore", "ignore", "pipe"],
+      windowsHide: true,
+    },
+  );
+  let stderr = "";
+  taskkill.stderr?.setEncoding("utf8");
+  taskkill.stderr?.on("data", (chunk: string) => {
+    stderr += chunk;
+  });
+
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (err?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      taskkill.off("error", onError);
+      taskkill.off("close", onClose);
+      if (err) reject(err);
+      else resolve();
+    };
+    const onError = (err: Error) => {
+      finish(new Error(`Failed to start taskkill for agent process ${pid}`, {
+        cause: err,
+      }));
+    };
+    const onClose = (code: number | null) => {
+      if (code === 0) {
+        finish();
+        return;
+      }
+      const detail = stderr.trim();
+      finish(
+        new Error(
+          `taskkill failed for agent process ${pid} with exit code ${String(code)}${detail ? `: ${detail}` : ""}`,
+        ),
+      );
+    };
+    const timeout = setTimeout(() => {
+      taskkill.kill();
+      finish(
+        new Error(
+          `Agent process tree ${pid} did not exit within ${timeoutMs}ms`,
+        ),
+      );
+    }, timeoutMs);
+    timeout.unref();
+    taskkill.once("error", onError);
+    taskkill.once("close", onClose);
+  });
 }
 
 function abortable<T>(

@@ -7,6 +7,7 @@ import {
   SessionManager,
   type UserSession,
 } from "../src/acp/session.js";
+import { killAgentAndWait } from "../src/acp/agent-manager.js";
 
 function makeProcess(
   kills: string[],
@@ -98,6 +99,8 @@ function makeManager(opts?: {
     removePersistedSessionId: opts?.removePersistedSessionId,
     createMcpLease: opts?.createMcpLease,
     agentShutdownTimeoutMs: opts?.agentShutdownTimeoutMs,
+    killAgentProcess: (process, timeoutMs) =>
+      killAgentAndWait(process, timeoutMs, { platform: "linux" }),
     showThoughts: false,
     log: () => {},
     onReply: opts?.onReply ?? (async () => {}),
