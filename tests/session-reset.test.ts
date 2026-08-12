@@ -931,10 +931,12 @@ test("reset waits for cleanup of a turn draining after process exit", async () =
       processCleanupCalls++;
     },
   });
+  let closeCalls = 0;
   const turn = makeControlledTurn(exiting.process, "obsolete response");
   turn.session.mcpLease = {
     mcpServer: {} as never,
     close: async () => {
+      closeCalls++;
       closeStarted();
       await closeReleased;
     },
@@ -964,6 +966,8 @@ test("reset waits for cleanup of a turn draining after process exit", async () =
 
   assert.equal(result.hadActiveSession, true);
   assert.equal(result.cancelledTurn, true);
+  assert.equal(processCleanupCalls, 1);
+  assert.equal(closeCalls, 1);
 });
 
 test("connection closure after process exit rejects an unanswered prompt", async () => {

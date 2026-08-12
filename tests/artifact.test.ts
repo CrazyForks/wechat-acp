@@ -10,6 +10,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
 import {
+  closeArtifactSessions,
   closeLease,
   startArtifactMcpServer,
 } from "../src/artifacts/server.js";
@@ -117,6 +118,48 @@ test("artifact MCP lease closure drains an in-flight initialization", async () =
   await closing;
   assert.equal(closeAttempts, 1);
   assert.equal(lease.sessionIds.size, 0);
+  assert.equal(sessions.size, 0);
+});
+
+test("artifact MCP shutdown drains an in-flight initialization", async () => {
+  const token = "lease-token";
+  const sessionId = "late-session";
+  const lease = {
+    sessionIds: new Set<string>(),
+    inFlightInitializations: new Set<Promise<void>>(),
+    closing: false,
+  };
+  const leases = new Map([[token, lease]]);
+  let closeAttempts = 0;
+  const session = {
+    mcp: {
+      close: async () => {
+        closeAttempts++;
+      },
+    } as unknown as McpServer,
+    transport: {} as StreamableHTTPServerTransport,
+    leaseToken: token,
+  };
+  const sessions = new Map<string, typeof session>();
+  let finishRequest!: () => void;
+  const request = new Promise<void>((resolve) => {
+    finishRequest = () => {
+      sessions.set(sessionId, session);
+      lease.sessionIds.add(sessionId);
+      resolve();
+    };
+  });
+  lease.inFlightInitializations.add(request);
+
+  const closing = closeArtifactSessions(leases, sessions);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(lease.closing, true);
+  assert.equal(leases.size, 0);
+  assert.equal(closeAttempts, 0);
+
+  finishRequest();
+  await closing;
+  assert.equal(closeAttempts, 1);
   assert.equal(sessions.size, 0);
 });
 

@@ -69,6 +69,7 @@ export interface UserSession {
   drainingExitedTurn?: boolean;
   promptDispatched?: boolean;
   exitCleanup?: Promise<void>;
+  cleanupRegistered?: boolean;
   connectionClosedError?: Promise<never>;
   lifecycleGeneration?: number;
   sessionIdPersisted?: boolean;
@@ -239,6 +240,7 @@ export class SessionManager {
         "Session stopped before queued message was processed",
       );
       this.rejectSessionCompletions(session, session.closedError);
+      session.cleanupRegistered = true;
       this.registerSessionCleanup(session, true);
     }
     this.sessions.clear();
@@ -462,6 +464,7 @@ export class SessionManager {
         cancelledTurn ||= session.processing;
         droppedQueueCount += session.queue.length;
         this.rejectSessionCompletions(session, resetError);
+        session.cleanupRegistered = true;
         this.registerSessionCleanup(session, true);
       }
       this.sessions.delete(userId);
@@ -1413,6 +1416,11 @@ export class SessionManager {
 
   private finalizeExitedSession(session: UserSession): Promise<void> {
     if (session.exitCleanup) return session.exitCleanup;
+    if (session.cleanupRegistered) {
+      session.drainingExitedTurn = false;
+      this.untrackExitedSession(session);
+      return Promise.resolve();
+    }
     session.drainingExitedTurn = false;
     const error =
       session.closedError ??

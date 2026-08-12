@@ -154,9 +154,14 @@ export async function startArtifactMcpServer(options: {
   const address = httpServer.address() as AddressInfo;
   const url = `http://127.0.0.1:${address.port}${MCP_PATH}`;
   options.log(`[artifact-mcp] listening at ${url}`);
+  let serverClosing = false;
+  let serverClose: Promise<void> | undefined;
 
   return {
     createLease: () => {
+      if (serverClosing) {
+        throw new Error("Artifact MCP server is closing");
+      }
       const token = randomBytes(32).toString("base64url");
       const lease: ArtifactLeaseState = {
         sessionIds: new Set(),
@@ -195,35 +200,92 @@ export async function startArtifactMcpServer(options: {
       };
     },
     resolveResourceLink: (link) => store.resolveResourceLink(link),
-    close: async () => {
-      const results = await Promise.allSettled(
-        [...sessions.values()].map(({ mcp }) => mcp.close()),
+    close: () => {
+      if (serverClose) return serverClose;
+      serverClosing = true;
+      serverClose = closeArtifactServer(
+        leases,
+        sessions,
+        httpServer,
+        store,
       );
-      sessions.clear();
-      leases.clear();
-      let httpError: unknown;
-      try {
-        await closeHttpServer(httpServer);
-      } catch (err) {
-        httpError = err;
-      } finally {
-        store.close();
-      }
-      const failures = results.filter(
-        (result): result is PromiseRejectedResult =>
-          result.status === "rejected",
-      );
-      if (failures.length > 0 || httpError !== undefined) {
-        throw new AggregateError(
-          [
-            ...failures.map((failure) => failure.reason),
-            ...(httpError !== undefined ? [httpError] : []),
-          ],
-          "Failed to close artifact MCP server",
-        );
-      }
+      return serverClose;
     },
   };
+}
+
+async function closeArtifactServer(
+  leases: Map<string, ArtifactLeaseState>,
+  sessions: Map<
+    string,
+    {
+      mcp: McpServer;
+      transport: StreamableHTTPServerTransport;
+      leaseToken: string;
+    }
+  >,
+  httpServer: HttpServer,
+  store: ArtifactStore,
+): Promise<void> {
+  let sessionError: unknown;
+  try {
+    await closeArtifactSessions(leases, sessions);
+  } catch (err) {
+    sessionError = err;
+  }
+  let httpError: unknown;
+  try {
+    await closeHttpServer(httpServer);
+  } catch (err) {
+    httpError = err;
+  } finally {
+    store.close();
+  }
+  if (sessionError !== undefined || httpError !== undefined) {
+    throw new AggregateError(
+      [
+        ...(sessionError !== undefined ? [sessionError] : []),
+        ...(httpError !== undefined ? [httpError] : []),
+      ],
+      "Failed to close artifact MCP server",
+    );
+  }
+}
+
+export async function closeArtifactSessions(
+  leases: Map<string, ArtifactLeaseState>,
+  sessions: Map<
+    string,
+    {
+      mcp: McpServer;
+      transport: StreamableHTTPServerTransport;
+      leaseToken: string;
+    }
+  >,
+): Promise<void> {
+  const leaseStates = [...leases.values()];
+  for (const lease of leaseStates) {
+    lease.closing = true;
+  }
+  leases.clear();
+  await Promise.all(
+    leaseStates.flatMap((lease) => [...lease.inFlightInitializations]),
+  );
+
+  const results = await Promise.allSettled(
+    [...sessions.values()].map(({ mcp }) => mcp.close()),
+  );
+  sessions.clear();
+  const failures = results.filter(
+    (result): result is PromiseRejectedResult =>
+      result.status === "rejected",
+  );
+  if (failures.length > 0) {
+    throw new AggregateError(
+      failures.map((failure) => failure.reason),
+      "Failed to close artifact MCP sessions",
+    );
+  }
 }
 
 export async function closeLease(
