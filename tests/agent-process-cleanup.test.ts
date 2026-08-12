@@ -109,7 +109,7 @@ test("Windows cleanup retries taskkill while the wrapper is running", async () =
   assert.equal(attempts, 2);
 });
 
-test("Windows cleanup rejects an exited wrapper without verified tree cleanup", async () => {
+test("Windows cleanup accepts a natural wrapper exit without a taskkill failure", async () => {
   const state = { exitCode: 0 as number | null };
   const proc = new EventEmitter() as ChildProcess;
   Object.defineProperties(proc, {
@@ -118,10 +118,7 @@ test("Windows cleanup rejects an exited wrapper without verified tree cleanup", 
     signalCode: { value: null },
   });
 
-  await assert.rejects(
-    killAgentAndWait(proc, 1234, { platform: "win32" }),
-    /wrapper exited before its Windows process tree could be stopped/,
-  );
+  await killAgentAndWait(proc, 1234, { platform: "win32" });
 });
 
 test("POSIX cleanup targets the process group after wrapper exit", async () => {

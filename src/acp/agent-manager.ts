@@ -273,11 +273,9 @@ export async function killAgentAndWait(
       proc.exitCode !== null || proc.signalCode !== null;
     if (retainedFailure && wrapperExited) throw retainedFailure.error;
     if (wrapperExited) {
-      const error = new Error(
-        "Agent wrapper exited before its Windows process tree could be stopped",
-      );
-      uncertainWindowsProcessTrees.set(proc, { error });
-      throw error;
+      // A natural shell exit has no actionable tree root. Only a prior
+      // taskkill failure leaves evidence that cleanup is uncertain.
+      return;
     }
     if (proc.pid === undefined) {
       throw new Error("Cannot stop agent process tree without a process ID");
