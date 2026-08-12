@@ -16,7 +16,6 @@ import {
 import type { AgentResourceLink } from "../artifacts/types.js";
 import {
   spawnAgent,
-  killAgent,
   killAgentAndWait,
   AgentProcessCleanupError,
   type AgentProcessInfo,
@@ -155,6 +154,7 @@ export class SessionManager {
   private userGenerations = new Map<string, number>();
   private resetOperations = new Map<string, Promise<ResetSessionResult>>();
   private cleanupStates = new Map<string, SessionCleanupState>();
+  private cleanupOperations = new Map<string, Promise<void>>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private opts: SessionManagerOpts;
   private aborted = false;
@@ -240,8 +240,15 @@ export class SessionManager {
     try {
       session =
         this.sessions.get(userId) ??
-        (await this.getOrCreateSession(userId, message.contextToken));
+        (await this.getOrCreateSession(
+          userId,
+          message.contextToken,
+          () => this.isUserGenerationCurrent(userId, generation),
+        ));
     } catch (err) {
+      if (!this.isUserGenerationCurrent(userId, generation)) {
+        throw new SessionResetError();
+      }
       if (err instanceof SessionResetError) {
         throw err;
       }
@@ -445,11 +452,22 @@ export class SessionManager {
   private getOrCreateSession(
     userId: string,
     contextToken: string,
+    isCurrent: () => boolean = () => true,
   ): Promise<UserSession> {
+    if (!isCurrent()) {
+      return Promise.reject(new SessionResetError());
+    }
     const existing = this.sessions.get(userId);
     if (existing) return Promise.resolve(existing);
     const pending = this.pendingSessions.get(userId);
     if (pending) return pending.promise;
+    const cleanupOperation = this.cleanupOperations.get(userId);
+    if (cleanupOperation) {
+      return cleanupOperation.then(() => {
+        if (!isCurrent()) throw new SessionResetError();
+        return this.getOrCreateSession(userId, contextToken, isCurrent);
+      });
+    }
     if (this.cleanupStates.has(userId)) {
       return Promise.reject(
         new Error(
@@ -461,7 +479,25 @@ export class SessionManager {
       this.reservedSessionCount() >=
       this.opts.maxConcurrentUsers
     ) {
-      this.evictOldest();
+      const eviction = this.evictOldest();
+      if (eviction) {
+        return eviction.then(
+          () => {
+            if (!isCurrent()) throw new SessionResetError();
+            return this.getOrCreateSession(userId, contextToken, isCurrent);
+          },
+          (err) => {
+            if (
+              this.reservedSessionCount() >=
+              this.opts.maxConcurrentUsers
+            ) {
+              throw err;
+            }
+            if (!isCurrent()) throw new SessionResetError();
+            return this.getOrCreateSession(userId, contextToken, isCurrent);
+          },
+        );
+      }
     }
     if (
       this.reservedSessionCount() >=
@@ -481,6 +517,9 @@ export class SessionManager {
         throw new Error("Session manager is stopped");
       }
       if (entry.cancelled) {
+        throw new SessionResetError();
+      }
+      if (!isCurrent()) {
         throw new SessionResetError();
       }
       const existingAfterWait = this.sessions.get(userId);
@@ -506,19 +545,11 @@ export class SessionManager {
         throw err;
       }
       if (this.aborted) {
-        const cleanupState = this.getOrCreateCleanupState(userId);
-        cleanupState.processes.add(created.agentInfo.process);
-        if (created.mcpLease) {
-          cleanupState.mcpLeases.add(created.mcpLease);
-        }
+        this.registerSessionCleanup(created, true);
         throw new Error("Session manager stopped while creating a session");
       }
       if (entry.cancelled) {
-        const cleanupState = this.getOrCreateCleanupState(userId);
-        cleanupState.processes.add(created.agentInfo.process);
-        if (created.mcpLease) {
-          cleanupState.mcpLeases.add(created.mcpLease);
-        }
+        this.registerSessionCleanup(created, true);
         try {
           await this.retryCleanupState(userId);
         } catch (err) {
@@ -531,8 +562,8 @@ export class SessionManager {
 
       const winner = this.sessions.get(userId);
       if (winner) {
-        killAgent(created.agentInfo.process);
-        await created.mcpLease?.close();
+        this.registerSessionCleanup(created, true);
+        await this.retryCleanupState(userId);
         return winner;
       }
       this.sessions.set(userId, created);
@@ -600,71 +631,115 @@ export class SessionManager {
     }
   }
 
-  private async retryCleanupState(userId: string): Promise<void> {
-    const state = this.cleanupStates.get(userId);
-    if (!state) return;
+  private registerSessionCleanup(
+    session: UserSession,
+    includeProcess: boolean,
+  ): void {
+    const processRunning =
+      session.agentInfo.process.exitCode === null &&
+      session.agentInfo.process.signalCode === null;
+    if (!session.mcpLease && (!includeProcess || !processRunning)) return;
+    const state = this.getOrCreateCleanupState(session.userId);
+    if (includeProcess && processRunning) {
+      state.processes.add(session.agentInfo.process);
+    }
+    if (session.mcpLease) {
+      state.mcpLeases.add(session.mcpLease);
+    }
+  }
 
-    const operations: Array<{
-      run: () => Promise<void>;
-      complete: () => void;
-    }> = [];
-    for (const process of state.processes) {
-      operations.push({
-        run: () =>
-          (this.opts.killAgentProcess ?? killAgentAndWait)(
-            process,
-            this.opts.agentShutdownTimeoutMs,
-          ),
-        complete: () => {
-          state.processes.delete(process);
-        },
-      });
-    }
-    for (const lease of state.mcpLeases) {
-      operations.push({
-        run: () => lease.close(),
-        complete: () => {
-          state.mcpLeases.delete(lease);
-        },
-      });
-    }
-    if (
-      state.removePersistedSessionId &&
-      this.opts.removePersistedSessionId
-    ) {
-      operations.push({
-        run: () => this.opts.removePersistedSessionId!(userId),
-        complete: () => {
-          state.removePersistedSessionId = false;
-        },
-      });
-    }
-
-    const results = await Promise.allSettled(
-      operations.map(({ run }) => Promise.resolve().then(run)),
-    );
-    const failures: unknown[] = [];
-    for (let index = 0; index < results.length; index++) {
-      const result = results[index]!;
-      if (result.status === "fulfilled") {
-        operations[index]!.complete();
-      } else {
-        failures.push(result.reason);
-      }
-    }
-
-    if (
-      state.processes.size === 0 &&
-      state.mcpLeases.size === 0 &&
-      !state.removePersistedSessionId
-    ) {
-      this.cleanupStates.delete(userId);
-    }
-    if (failures.length > 0) {
-      throw new AggregateError(
-        failures,
-        "Failed to fully reset ACP session",
+  private retryCleanupInBackground(userId: string, source: string): void {
+    void this.retryCleanupState(userId).catch((err) => {
+      this.opts.log(
+        `[${userId}] ${source} cleanup failed and was retained for retry: ${String(err)}`,
       );
+      trackException(err, "session.cleanup", hashUserId(userId));
+    });
+  }
+
+  private retryCleanupState(userId: string): Promise<void> {
+    const existing = this.cleanupOperations.get(userId);
+    if (existing) return existing;
+    const operation = this.runCleanupState(userId);
+    this.cleanupOperations.set(userId, operation);
+    void operation.finally(() => {
+      if (this.cleanupOperations.get(userId) === operation) {
+        this.cleanupOperations.delete(userId);
+      }
+    }).catch(() => {});
+    return operation;
+  }
+
+  private async runCleanupState(userId: string): Promise<void> {
+    while (true) {
+      const state = this.cleanupStates.get(userId);
+      if (!state) return;
+
+      const operations: Array<{
+        run: () => Promise<void>;
+        complete: () => void;
+      }> = [];
+      for (const process of state.processes) {
+        operations.push({
+          run: () =>
+            (this.opts.killAgentProcess ?? killAgentAndWait)(
+              process,
+              this.opts.agentShutdownTimeoutMs,
+            ),
+          complete: () => {
+            state.processes.delete(process);
+          },
+        });
+      }
+      for (const lease of state.mcpLeases) {
+        operations.push({
+          run: () => lease.close(),
+          complete: () => {
+            state.mcpLeases.delete(lease);
+          },
+        });
+      }
+      if (
+        state.removePersistedSessionId &&
+        this.opts.removePersistedSessionId
+      ) {
+        operations.push({
+          run: () => this.opts.removePersistedSessionId!(userId),
+          complete: () => {
+            state.removePersistedSessionId = false;
+          },
+        });
+      }
+
+      const results = await Promise.allSettled(
+        operations.map(({ run }) => Promise.resolve().then(run)),
+      );
+      const failures: unknown[] = [];
+      for (let index = 0; index < results.length; index++) {
+        const result = results[index]!;
+        if (result.status === "fulfilled") {
+          operations[index]!.complete();
+        } else {
+          failures.push(result.reason);
+        }
+      }
+
+      if (failures.length > 0) {
+        throw new AggregateError(
+          failures,
+          "Failed to fully reset ACP session",
+        );
+      }
+      if (
+        state.processes.size === 0 &&
+        state.mcpLeases.size === 0 &&
+        !state.removePersistedSessionId
+      ) {
+        if (this.cleanupStates.get(userId) === state) {
+          this.cleanupStates.delete(userId);
+        }
+        return;
+      }
     }
   }
 
@@ -775,10 +850,9 @@ export class SessionManager {
           "Agent process exited before queued message was processed",
         );
         this.rejectQueuedCompletions(s, s.closedError);
+        this.registerSessionCleanup(s, false);
         this.sessions.delete(userId);
-        void s.mcpLease?.close().catch((err) => {
-          this.opts.log(`[${userId}] Failed to close artifact MCP lease: ${String(err)}`);
-        });
+        this.retryCleanupInBackground(userId, "Agent exit");
       }
     });
 
@@ -977,9 +1051,21 @@ export class SessionManager {
               err instanceof Error ? err : new Error(String(err));
             this.rejectQueuedCompletions(session, err);
             if (this.sessions.get(session.userId) === session) {
+              this.registerSessionCleanup(session, true);
               this.sessions.delete(session.userId);
             }
-            await session.mcpLease?.close();
+            try {
+              await this.retryCleanupState(session.userId);
+            } catch (cleanupErr) {
+              this.opts.log(
+                `[${session.userId}] Agent failure cleanup was retained for retry: ${String(cleanupErr)}`,
+              );
+              trackException(
+                cleanupErr,
+                "session.cleanup",
+                hashUserId(session.userId),
+              );
+            }
             return;
           }
 
@@ -1024,16 +1110,15 @@ export class SessionManager {
         session.closedError = new Error(
           "Session expired before queued message was processed",
         );
-        killAgent(session.agentInfo.process);
+        this.rejectQueuedCompletions(session, session.closedError);
+        this.registerSessionCleanup(session, true);
         this.sessions.delete(userId);
-        void session.mcpLease?.close().catch((err) => {
-          this.opts.log(`[${userId}] Failed to close artifact MCP lease: ${String(err)}`);
-        });
+        this.retryCleanupInBackground(userId, "Idle session");
       }
     }
   }
 
-  private evictOldest(): void {
+  private evictOldest(): Promise<void> | undefined {
     let oldest: { userId: string; lastActivity: number } | null = null;
     for (const [userId, session] of this.sessions) {
       if (
@@ -1052,13 +1137,12 @@ export class SessionManager {
           "Session evicted before queued message was processed",
         );
         this.rejectQueuedCompletions(session, session.closedError);
-        killAgent(session.agentInfo.process);
+        this.registerSessionCleanup(session, true);
         this.sessions.delete(oldest.userId);
-        void session.mcpLease?.close().catch((err) => {
-          this.opts.log(`[${oldest.userId}] Failed to close artifact MCP lease: ${String(err)}`);
-        });
+        return this.retryCleanupState(oldest.userId);
       }
     }
+    return undefined;
   }
 
   private rejectQueuedCompletions(session: UserSession, err: unknown): void {

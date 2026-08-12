@@ -11,7 +11,7 @@ import { killAgentAndWait } from "../src/acp/agent-manager.js";
 
 function makeProcess(
   kills: string[],
-  opts?: { exitOnKill?: boolean },
+  opts?: { exitOnKill?: boolean; initiallyKilled?: boolean },
 ): ChildProcess {
   const emitter = new EventEmitter();
   const state: {
@@ -19,7 +19,7 @@ function makeProcess(
     exitCode: number | null;
     signalCode: NodeJS.Signals | null;
   } = {
-    killed: false,
+    killed: opts?.initiallyKilled ?? false,
     exitCode: null,
     signalCode: null,
   };
@@ -87,20 +87,27 @@ function makeManager(opts?: {
   };
   agentShutdownTimeoutMs?: number;
   maxConcurrentUsers?: number;
+  idleTimeoutMs?: number;
+  killAgentProcess?: (
+    process: ChildProcess,
+    timeoutMs?: number,
+  ) => Promise<void>;
 }): SessionManager {
   return new SessionManager({
     agentCommand: "unused",
     agentArgs: [],
     agentCwd: process.cwd(),
-    idleTimeoutMs: 0,
+    idleTimeoutMs: opts?.idleTimeoutMs ?? 0,
     maxConcurrentUsers: opts?.maxConcurrentUsers ?? 3,
     resumePolicy: opts?.getPersistedSessionId ? "auto" : "off",
     getPersistedSessionId: opts?.getPersistedSessionId,
     removePersistedSessionId: opts?.removePersistedSessionId,
     createMcpLease: opts?.createMcpLease,
     agentShutdownTimeoutMs: opts?.agentShutdownTimeoutMs,
-    killAgentProcess: (process, timeoutMs) =>
-      killAgentAndWait(process, timeoutMs, { platform: "linux" }),
+    killAgentProcess:
+      opts?.killAgentProcess ??
+      ((process, timeoutMs) =>
+        killAgentAndWait(process, timeoutMs, { platform: "linux" })),
     showThoughts: false,
     log: () => {},
     onReply: opts?.onReply ?? (async () => {}),
@@ -649,6 +656,239 @@ test("SessionManager.stop retries cleanup retained by a failed reset", async () 
   await assert.rejects(manager.resetSession("target"), /fully reset/i);
   await manager.stop();
   assert.equal(closeCalls, 2);
+});
+
+test("idle cleanup retains failures for a later acp-new retry", async () => {
+  const kills: string[] = [];
+  let closeCalls = 0;
+  const manager = makeManager({ idleTimeoutMs: 1 });
+  const session = makeSession("target", {
+    process: makeProcess(kills),
+    close: async () => {
+      closeCalls++;
+      if (closeCalls === 1) {
+        throw new Error("lease cleanup failed");
+      }
+    },
+  });
+  session.lastActivity = 0;
+  const internal = manager as unknown as {
+    sessions: Map<string, UserSession>;
+    cleanupIdleSessions(): void;
+  };
+  internal.sessions.set("target", session);
+
+  internal.cleanupIdleSessions();
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(manager.getSession("target"), undefined);
+  assert.equal(closeCalls, 1);
+  assert.deepEqual(kills, ["SIGTERM"]);
+
+  await manager.resetSession("target");
+  assert.equal(closeCalls, 2);
+});
+
+test("capacity eviction waits for old resources to close", async () => {
+  let releaseLease!: () => void;
+  const leaseClosed = new Promise<void>((resolve) => {
+    releaseLease = resolve;
+  });
+  const manager = makeManager({ maxConcurrentUsers: 1 });
+  const oldSession = makeSession("old", {
+    close: async () => leaseClosed,
+  });
+  const internal = manager as unknown as {
+    sessions: Map<string, UserSession>;
+    createSession(
+      userId: string,
+      contextToken: string,
+      signal: AbortSignal,
+    ): Promise<UserSession>;
+    getOrCreateSession(userId: string, contextToken: string): Promise<UserSession>;
+  };
+  internal.sessions.set("old", oldSession);
+  let createStarted = false;
+  internal.createSession = async (userId) => {
+    createStarted = true;
+    return makeSession(userId);
+  };
+
+  const creation = internal.getOrCreateSession("new", "context-new");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(createStarted, false);
+  assert.equal(manager.getSession("old"), undefined);
+
+  releaseLease();
+  assert.equal((await creation).userId, "new");
+  assert.equal(createStarted, true);
+});
+
+test("prompt failure cleanup retains process and lease failures", async () => {
+  const process = makeProcess([], {
+    exitOnKill: false,
+    initiallyKilled: true,
+  });
+  let processCleanupCalls = 0;
+  let closeCalls = 0;
+  const manager = makeManager({
+    killAgentProcess: async () => {
+      processCleanupCalls++;
+    },
+  });
+  const session = makeSession("target", {
+    process,
+    processing: true,
+    queue: [{ prompt: [], contextToken: "context" }],
+    close: async () => {
+      closeCalls++;
+      if (closeCalls === 1) {
+        throw new Error("lease cleanup failed");
+      }
+    },
+  });
+  const internal = manager as unknown as {
+    sessions: Map<string, UserSession>;
+    processQueue(session: UserSession): Promise<void>;
+  };
+  internal.sessions.set("target", session);
+
+  await internal.processQueue(session);
+  assert.equal(manager.getSession("target"), undefined);
+  assert.equal(processCleanupCalls, 1);
+  assert.equal(closeCalls, 1);
+
+  await manager.resetSession("target");
+  assert.equal(closeCalls, 2);
+});
+
+test("reset suppresses an obsolete enqueue cleanup error", async () => {
+  const replies: string[] = [];
+  let releaseCleanup!: () => void;
+  const cleanupReleased = new Promise<void>((resolve) => {
+    releaseCleanup = resolve;
+  });
+  let closeCalls = 0;
+  const manager = makeManager({
+    onReply: async (_userId, _contextToken, text) => {
+      replies.push(text);
+    },
+  });
+  const internal = manager as unknown as {
+    getOrCreateCleanupState(userId: string): {
+      mcpLeases: Set<{
+        mcpServer: never;
+        close(): Promise<void>;
+      }>;
+    };
+    retryCleanupState(userId: string): Promise<void>;
+  };
+  internal.getOrCreateCleanupState("target").mcpLeases.add({
+    mcpServer: {} as never,
+    close: async () => {
+      closeCalls++;
+      if (closeCalls === 1) {
+        await cleanupReleased;
+        throw new Error("lease cleanup failed");
+      }
+    },
+  });
+  const backgroundCleanup = internal.retryCleanupState("target");
+  void backgroundCleanup.catch(() => {});
+  const enqueue = manager.enqueue("target", {
+    prompt: [],
+    contextToken: "context-old",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const reset = manager.resetSession("target");
+  releaseCleanup();
+
+  await assert.rejects(enqueue, /session reset/i);
+  await assert.rejects(backgroundCleanup, /fully reset/i);
+  await reset;
+  assert.equal(closeCalls, 2);
+  assert.deepEqual(replies, []);
+});
+
+test("reset prevents obsolete creation after cleanup succeeds", async () => {
+  let releaseCleanup!: () => void;
+  const cleanupReleased = new Promise<void>((resolve) => {
+    releaseCleanup = resolve;
+  });
+  const manager = makeManager();
+  let createStarted = false;
+  const internal = manager as unknown as {
+    getOrCreateCleanupState(userId: string): {
+      mcpLeases: Set<{
+        mcpServer: never;
+        close(): Promise<void>;
+      }>;
+    };
+    retryCleanupState(userId: string): Promise<void>;
+    createSession(
+      userId: string,
+      contextToken: string,
+      signal: AbortSignal,
+    ): Promise<UserSession>;
+  };
+  internal.createSession = async (userId) => {
+    createStarted = true;
+    return makeSession(userId);
+  };
+  internal.getOrCreateCleanupState("target").mcpLeases.add({
+    mcpServer: {} as never,
+    close: async () => cleanupReleased,
+  });
+  const backgroundCleanup = internal.retryCleanupState("target");
+  const enqueue = manager.enqueue("target", {
+    prompt: [],
+    contextToken: "context-old",
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  const reset = manager.resetSession("target");
+  releaseCleanup();
+
+  await backgroundCleanup;
+  await assert.rejects(enqueue, /session reset/i);
+  await reset;
+  assert.equal(createStarted, false);
+});
+
+test("persistence failure does not block an unrelated capacity eviction", async () => {
+  let releaseLease!: () => void;
+  const leaseReleased = new Promise<void>((resolve) => {
+    releaseLease = resolve;
+  });
+  const manager = makeManager({
+    maxConcurrentUsers: 1,
+    removePersistedSessionId: async () => {
+      throw new Error("state write failed");
+    },
+  });
+  const oldSession = makeSession("old", {
+    close: async () => leaseReleased,
+  });
+  const internal = manager as unknown as {
+    sessions: Map<string, UserSession>;
+    createSession(
+      userId: string,
+      contextToken: string,
+      signal: AbortSignal,
+    ): Promise<UserSession>;
+    getOrCreateSession(userId: string, contextToken: string): Promise<UserSession>;
+  };
+  internal.sessions.set("old", oldSession);
+  internal.createSession = async (userId) => makeSession(userId);
+
+  const creation = internal.getOrCreateSession("new", "context-new");
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  const reset = manager.resetSession("old");
+  releaseLease();
+
+  assert.equal((await creation).userId, "new");
+  await assert.rejects(reset, /fully reset/i);
+  assert.equal(manager.getSession("new")?.userId, "new");
 });
 
 test("an old turn cannot reply or remove the replacement session after reset", async () => {
