@@ -20,6 +20,20 @@ export interface AgentProcessInfo {
   sessionOutcome: AgentSessionOutcome;
 }
 
+export class AgentProcessCleanupError extends AggregateError {
+  constructor(
+    startupError: unknown,
+    cleanupError: unknown,
+    readonly process: ChildProcess,
+  ) {
+    super(
+      [startupError, cleanupError],
+      "Agent startup failed and the process could not be stopped",
+    );
+    this.name = "AgentProcessCleanupError";
+  }
+}
+
 export async function spawnAgent(params: {
   command: string;
   args: string[];
@@ -178,7 +192,11 @@ export async function spawnAgent(params: {
       sessionOutcome,
     };
   } catch (err) {
-    killAgent(proc);
+    try {
+      await killAgentAndWait(proc);
+    } catch (cleanupErr) {
+      throw new AgentProcessCleanupError(err, cleanupErr, proc);
+    }
     throw err;
   } finally {
     signal?.removeEventListener("abort", abortSpawn);
@@ -216,6 +234,43 @@ export function killAgent(proc: ChildProcess): void {
         proc.kill("SIGKILL");
       }
     }, 5_000).unref();
+  }
+}
+
+export async function killAgentAndWait(
+  proc: ChildProcess,
+  timeoutMs = 6_000,
+): Promise<void> {
+  if (proc.exitCode !== null || proc.signalCode !== null) return;
+
+  let settle!: () => void;
+  const exited = new Promise<void>((resolve) => {
+    settle = resolve;
+    proc.once("exit", settle);
+    proc.once("close", settle);
+  });
+  killAgent(proc);
+  if (proc.exitCode !== null || proc.signalCode !== null) {
+    proc.off("exit", settle);
+    proc.off("close", settle);
+    return;
+  }
+
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      exited,
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(
+          () => reject(new Error(`Agent process did not exit within ${timeoutMs}ms`)),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+    proc.off("exit", settle);
+    proc.off("close", settle);
   }
 }
 

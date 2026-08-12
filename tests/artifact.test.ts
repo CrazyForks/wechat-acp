@@ -6,8 +6,13 @@ import { test } from "node:test";
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 
-import { startArtifactMcpServer } from "../src/artifacts/server.js";
+import {
+  closeLease,
+  startArtifactMcpServer,
+} from "../src/artifacts/server.js";
 import {
   ArtifactStore,
   sanitizeFileName,
@@ -31,6 +36,40 @@ test("sanitizeFileName strips line and bidirectional controls", () => {
     ),
     "report evil .pdf",
   );
+});
+
+test("artifact MCP lease closure retries failed sessions", async () => {
+  const token = "lease-token";
+  const sessionId = "session-id";
+  const sessionIds = new Set([sessionId]);
+  const leases = new Map([[token, sessionIds]]);
+  let closeAttempts = 0;
+  const session = {
+    mcp: {
+      close: async () => {
+        closeAttempts++;
+        if (closeAttempts === 1) {
+          throw new Error("close failed");
+        }
+      },
+    } as unknown as McpServer,
+    transport: {} as StreamableHTTPServerTransport,
+    leaseToken: token,
+  };
+  const sessions = new Map([[sessionId, session]]);
+
+  await assert.rejects(
+    closeLease(token, sessionIds, leases, sessions),
+    /Failed to close artifact MCP lease/,
+  );
+  assert.equal(leases.has(token), false);
+  assert.equal(sessionIds.has(sessionId), true);
+  assert.equal(sessions.has(sessionId), true);
+
+  await closeLease(token, sessionIds, leases, sessions);
+  assert.equal(closeAttempts, 2);
+  assert.equal(sessionIds.size, 0);
+  assert.equal(sessions.size, 0);
 });
 
 test("ArtifactStore snapshots allowed files and consumes artifacts once", async () => {

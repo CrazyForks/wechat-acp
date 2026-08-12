@@ -64,3 +64,14 @@ test("acp-more aliases validate and bare aliases match only the full message", (
   );
   assert.equal(matchBridgeCommand(". extra", BRIDGE_COMMANDS.acpMore, aliases), null);
 });
+
+test("acp-new supports a configurable clear alias", () => {
+  const aliases = {
+    [BRIDGE_COMMANDS.acpNew]: ["/acp-clear"],
+  };
+  assert.doesNotThrow(() => validateCommandAliases(aliases));
+  assert.equal(
+    matchBridgeCommand("/acp-clear", BRIDGE_COMMANDS.acpNew, aliases),
+    BRIDGE_COMMANDS.acpNew,
+  );
+});

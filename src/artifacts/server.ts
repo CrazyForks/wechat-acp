@@ -126,8 +126,10 @@ export async function startArtifactMcpServer(options: {
   return {
     createLease: () => {
       const token = randomBytes(32).toString("base64url");
-      leases.set(token, new Set());
+      const leaseSessions = new Set<string>();
+      leases.set(token, leaseSessions);
       let closed = false;
+      let closing: Promise<void> | undefined;
       return {
         mcpServer: {
           name: "wechat-acp-artifacts",
@@ -137,8 +139,22 @@ export async function startArtifactMcpServer(options: {
         },
         close: async () => {
           if (closed) return;
-          closed = true;
-          await closeLease(token, leases, sessions);
+          if (closing) return closing;
+          const attempt = closeLease(
+            token,
+            leaseSessions,
+            leases,
+            sessions,
+          );
+          closing = attempt;
+          try {
+            await attempt;
+            closed = true;
+          } finally {
+            if (closing === attempt) {
+              closing = undefined;
+            }
+          }
         },
       };
     },
@@ -174,8 +190,9 @@ export async function startArtifactMcpServer(options: {
   };
 }
 
-async function closeLease(
+export async function closeLease(
   token: string,
+  sessionIds: Set<string>,
   leases: Map<string, Set<string>>,
   sessions: Map<
     string,
@@ -186,24 +203,47 @@ async function closeLease(
     }
   >,
 ): Promise<void> {
-  const sessionIds = leases.get(token);
-  if (!sessionIds) return;
   leases.delete(token);
-  const closing: Promise<void>[] = [];
+  const closing: Array<{
+    sessionId: string;
+    session: {
+      mcp: McpServer;
+      transport: StreamableHTTPServerTransport;
+      leaseToken: string;
+    };
+    promise: Promise<void>;
+  }> = [];
   for (const sessionId of sessionIds) {
     const session = sessions.get(sessionId);
-    if (!session || session.leaseToken !== token) continue;
-    sessions.delete(sessionId);
-    closing.push(session.mcp.close());
+    if (!session || session.leaseToken !== token) {
+      sessionIds.delete(sessionId);
+      continue;
+    }
+    closing.push({
+      sessionId,
+      session,
+      promise: Promise.resolve().then(() => session.mcp.close()),
+    });
   }
-  const results = await Promise.allSettled(closing);
-  const failures = results.filter(
-    (result): result is PromiseRejectedResult =>
-      result.status === "rejected",
+  const results = await Promise.allSettled(
+    closing.map(({ promise }) => promise),
   );
+  const failures: unknown[] = [];
+  for (let index = 0; index < results.length; index++) {
+    const result = results[index]!;
+    const operation = closing[index]!;
+    if (result.status === "fulfilled") {
+      if (sessions.get(operation.sessionId) === operation.session) {
+        sessions.delete(operation.sessionId);
+      }
+      sessionIds.delete(operation.sessionId);
+    } else {
+      failures.push(result.reason);
+    }
+  }
   if (failures.length > 0) {
     throw new AggregateError(
-      failures.map((failure) => failure.reason),
+      failures,
       "Failed to close artifact MCP lease",
     );
   }

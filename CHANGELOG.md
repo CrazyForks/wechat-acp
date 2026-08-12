@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add `/acp-new` to clear one WeChat user's ACP conversation without restarting
+  the bridge. The command stops that user's active turn and agent process, drops
+  queued and buffered messages, removes the persisted session ID for every
+  resume policy, and lazily creates a fresh `session/new` conversation on the
+  next normal message. Other users are not affected, and custom aliases such as
+  `/acp-clear` work through `commandAliases`. Fixes #8.
 - Add `/acp-more` to re-deliver text segments that iLink rejected after normal
   retries. Pending segments expire after 10 minutes, drain in order on the
   existing per-user send chain, stop on the first persistent fetch failure, and

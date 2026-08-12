@@ -14,7 +14,10 @@ import type { UploadedImageMedia, UploadedFileMedia } from "./weixin/send.js";
 import { sendTyping, getConfig } from "./weixin/api.js";
 import { TypingStatus, MessageType } from "./weixin/types.js";
 import type { WeixinMessage } from "./weixin/types.js";
-import { SessionManager } from "./acp/session.js";
+import {
+  SessionManager,
+  type ResetSessionResult,
+} from "./acp/session.js";
 import { AUDIO_MIME_EXTENSIONS } from "./acp/client.js";
 import type { AgentImage, AgentAudio, AgentFile } from "./acp/client.js";
 import {
@@ -44,6 +47,7 @@ import { trackEvent, trackException, hashUserId } from "./telemetry/index.js";
 
 const ACP_CONFIG_COMMAND = BRIDGE_COMMANDS.acpConfig;
 const ACP_CANCEL_COMMAND = BRIDGE_COMMANDS.acpCancel;
+const ACP_NEW_COMMAND = BRIDGE_COMMANDS.acpNew;
 const ACP_MORE_COMMAND = BRIDGE_COMMANDS.acpMore;
 const BUFFER_START_COMMAND = BRIDGE_COMMANDS.promptStart;
 const BUFFER_DONE_COMMAND = BRIDGE_COMMANDS.promptDone;
@@ -53,6 +57,14 @@ const PENDING_TEXT_TTL_MS = 10 * 60 * 1000;
 const PENDING_TEXT_MAX_SEGMENTS = 50;
 const SEGMENT_SEND_MAX_ATTEMPTS = 3;
 const SEGMENT_SEND_RETRY_BASE_MS = 300;
+
+interface MessageBuffer {
+  blocks: acp.ContentBlock[];
+  contextToken: string;
+  pending: Promise<void>;
+  lastUpdatedAt: number;
+  generation: number;
+}
 
 /**
  * Minimum spacing between two consecutive outbound text messages to the
@@ -81,14 +93,11 @@ export class WeChatAcpBridge {
   // (e.g. a command reply racing an active session flush) cannot interleave
   // their segments and arrive out of order (issue #38).
   private sendChains = new Map<string, Promise<void>>();
+  private messageHandlingChains = new Map<string, Promise<void>>();
+  private messageGenerations = new Map<string, number>();
   private pendingText: PendingTextRegistry;
   // Per-user message buffer for /acp-prompt-start.../acp-prompt-done multi-part compose
-  private messageBuffers = new Map<string, {
-    blocks: acp.ContentBlock[];
-    contextToken: string;
-    pending: Promise<void>;
-    lastUpdatedAt: number;
-  }>();
+  private messageBuffers = new Map<string, MessageBuffer>();
   // Per-user expiry timers for buffer cleanup
   private bufferTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // Users currently flushing their buffer (between /done and enqueue).
@@ -193,7 +202,7 @@ export class WeChatAcpBridge {
                 )
             : undefined,
         removePersistedSessionId:
-          resumePolicy !== "off" && stateFile
+          stateFile
             ? (userId) =>
                 this.enqueueStateUpdate(() =>
                   removePersistedSession(stateFile, userId, sessionScope),
@@ -300,6 +309,47 @@ export class WeChatAcpBridge {
     const contextToken = msg.context_token;
     if (!userId || !contextToken) return;
 
+    const acpNewCommand = this.extractAcpNewCommand(msg);
+    if (acpNewCommand === ACP_NEW_COMMAND) {
+      const generation = (this.messageGenerations.get(userId) ?? 0) + 1;
+      this.messageGenerations.set(userId, generation);
+      return this.trackMessageHandling(
+        userId,
+        this.handleUserMessage(msg, userId, contextToken, generation),
+      );
+    }
+
+    const generation = this.messageGenerations.get(userId) ?? 0;
+    const previous = this.messageHandlingChains.get(userId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => {})
+      .then(() => {
+        if (!this.isMessageGenerationCurrent(userId, generation)) return;
+        return this.handleUserMessage(msg, userId, contextToken, generation);
+      });
+    return this.trackMessageHandling(userId, current);
+  }
+
+  private async trackMessageHandling(
+    userId: string,
+    current: Promise<void>,
+  ): Promise<void> {
+    this.messageHandlingChains.set(userId, current);
+    try {
+      await current;
+    } finally {
+      if (this.messageHandlingChains.get(userId) === current) {
+        this.messageHandlingChains.delete(userId);
+      }
+    }
+  }
+
+  private async handleUserMessage(
+    msg: WeixinMessage,
+    userId: string,
+    contextToken: string,
+    generation: number,
+  ): Promise<void> {
     this.log(`Message from ${userId}: ${this.previewMessage(msg)}`);
     this.rememberActiveUser(userId, contextToken);
 
@@ -312,32 +362,53 @@ export class WeChatAcpBridge {
       hashUserId(userId),
     );
 
+    const acpNewCommand = this.extractAcpNewCommand(msg);
+    if (acpNewCommand) {
+      await this.handleAcpNewCommand(
+        acpNewCommand,
+        userId,
+        contextToken,
+        generation,
+      );
+      return;
+    }
+
     const acpConfigCommand = this.extractAcpConfigCommand(msg);
     if (acpConfigCommand) {
-      await this.handleAcpConfigCommand(acpConfigCommand, userId, contextToken);
+      await this.handleAcpConfigCommand(
+        acpConfigCommand,
+        userId,
+        contextToken,
+        generation,
+      );
       return;
     }
 
     const acpCancelCommand = this.extractAcpCancelCommand(msg);
     if (acpCancelCommand) {
-      await this.handleAcpCancelCommand(acpCancelCommand, userId, contextToken);
+      await this.handleAcpCancelCommand(
+        acpCancelCommand,
+        userId,
+        contextToken,
+        generation,
+      );
       return;
     }
 
     if (this.extractBridgeCommand(msg, ACP_MORE_COMMAND)) {
-      await this.handleAcpMoreCommand(userId, contextToken);
+      await this.handleAcpMoreCommand(userId, contextToken, generation);
       return;
     }
 
     // /acp-prompt-start — enter buffering mode
     if (this.isBufferStartCommand(msg)) {
-      this.handleBufferStart(userId, contextToken);
+      this.handleBufferStart(userId, contextToken, generation);
       return;
     }
 
     // /acp-prompt-done — flush buffer and send to agent
     if (this.isBufferDoneCommand(msg)) {
-      await this.handleBufferDone(userId, contextToken);
+      await this.handleBufferDone(userId, contextToken, generation);
       return;
     }
 
@@ -350,14 +421,27 @@ export class WeChatAcpBridge {
     this.beginAgentPrompt(userId, contextToken);
     const waitForFlush = this.bufferFlushing.get(userId);
     await (waitForFlush
-      ? waitForFlush.then(() => this.enqueueMessage(msg, userId, contextToken))
-      : this.enqueueMessage(msg, userId, contextToken));
+      ? waitForFlush.then(() =>
+          this.enqueueMessage(
+            msg,
+            userId,
+            contextToken,
+            () => this.isMessageGenerationCurrent(userId, generation),
+          ),
+        )
+      : this.enqueueMessage(
+          msg,
+          userId,
+          contextToken,
+          () => this.isMessageGenerationCurrent(userId, generation),
+        ));
   }
 
   protected async enqueueMessage(
     msg: WeixinMessage,
     userId: string,
     contextToken: string,
+    isCurrent: () => boolean = () => true,
   ): Promise<void> {
     const prompt = await weixinMessageToPrompt(
       msg,
@@ -366,7 +450,103 @@ export class WeChatAcpBridge {
       this.config.storage.inboxDir,
     );
 
+    if (!isCurrent()) return;
     await this.sessionManager!.enqueue(userId, { prompt, contextToken });
+  }
+
+  protected async resetUserSession(
+    userId: string,
+  ): Promise<ResetSessionResult> {
+    if (!this.sessionManager) {
+      throw new Error("Bridge is not ready yet.");
+    }
+    return this.sessionManager.resetSession(userId);
+  }
+
+  private async handleAcpNewCommand(
+    command: string,
+    userId: string,
+    contextToken: string,
+    generation: number,
+  ): Promise<void> {
+    const args = command.trim().split(/\s+/);
+    if (args.length > 1) {
+      await this.sendReply(
+        userId,
+        contextToken,
+        this.formatAcpNewUsage(`Unknown argument: ${args.slice(1).join(" ")}`),
+      );
+      return;
+    }
+
+    const buffer = this.messageBuffers.get(userId);
+    const droppedBufferedBlockCount = buffer?.blocks.length ?? 0;
+    this.messageBuffers.delete(userId);
+    this.bufferFlushing.delete(userId);
+    this.clearBufferTimer(userId);
+    this.pendingText.clearExisting(userId);
+
+    try {
+      const result = await this.resetUserSession(userId);
+      if (!this.isMessageGenerationCurrent(userId, generation)) return;
+      trackEvent(
+        "command.acp_new",
+        {
+          userIdHash: hashUserId(userId),
+          hadActiveSession: result.hadActiveSession,
+          cancelledTurn: result.cancelledTurn,
+          cancelledPendingCreation: result.cancelledPendingCreation,
+          droppedQueueCount: result.droppedQueueCount,
+          droppedBufferedBlockCount,
+        },
+        hashUserId(userId),
+      );
+      this.cancelTypingIndicator(userId, contextToken).catch(() => {});
+      await this.sendReply(
+        userId,
+        contextToken,
+        this.formatAcpNewResult(result, droppedBufferedBlockCount),
+      );
+    } catch (err) {
+      this.log(`Failed to reset ACP session for ${userId}: ${String(err)}`);
+      trackException(err, "session.reset", hashUserId(userId));
+      if (!this.isMessageGenerationCurrent(userId, generation)) return;
+      await this.sendReply(
+        userId,
+        contextToken,
+        `⚠️ Could not fully clear the ACP session: ${describeError(err)}. Restarting now may restore the previous context.`,
+      );
+    }
+  }
+
+  private formatAcpNewResult(
+    result: ResetSessionResult,
+    droppedBufferedBlockCount: number,
+  ): string {
+    const lines = [
+      "✅ ACP session cleared. Your next message will start a fresh session.",
+    ];
+    if (result.droppedQueueCount > 0) {
+      lines.push(`Dropped ${result.droppedQueueCount} queued message(s).`);
+    }
+    if (droppedBufferedBlockCount > 0) {
+      lines.push(
+        `Dropped ${droppedBufferedBlockCount} buffered content block(s).`,
+      );
+    }
+    return lines.join("\n");
+  }
+
+  private formatAcpNewUsage(error?: string): string {
+    const lines: string[] = [];
+    if (error) {
+      lines.push(`⚠️ ${error}`, "");
+    }
+    lines.push(
+      "💡 **Usage**",
+      `   • Start a fresh session:  ${ACP_NEW_COMMAND}${this.aliasHint(ACP_NEW_COMMAND)}`,
+    );
+    return lines.join("\n");
   }
 
   private async enqueueInjectedMessage(job: InjectedMessage): Promise<void> {
@@ -396,6 +576,7 @@ export class WeChatAcpBridge {
     command: string,
     userId: string,
     contextToken: string,
+    generation: number,
   ): Promise<void> {
     const args = command.trim().split(/\s+/);
     if (args.length === 1) {
@@ -424,6 +605,7 @@ export class WeChatAcpBridge {
       try {
         const resolved = this.resolveAcpConfigValue(userId, configId, rawValue);
         await this.sessionManager!.setSessionConfigOption(userId, configId, resolved.rawValue);
+        if (!this.isMessageGenerationCurrent(userId, generation)) return;
         const optionType = this.sessionManager!
           .getSessionConfigOptions(userId)
           ?.find((o) => o.id === configId)?.type;
@@ -443,6 +625,7 @@ export class WeChatAcpBridge {
           `✅ Updated ACP config: ${configId} = ${resolved.displayValue}\n\n${this.formatAcpConfigList(userId)}`,
         );
       } catch (err) {
+        if (!this.isMessageGenerationCurrent(userId, generation)) return;
         await this.sendReply(
           userId,
           contextToken,
@@ -463,6 +646,7 @@ export class WeChatAcpBridge {
     command: string,
     userId: string,
     contextToken: string,
+    generation: number,
   ): Promise<void> {
     const args = command.trim().split(/\s+/);
     const sub = args[1]?.toLowerCase();
@@ -479,6 +663,7 @@ export class WeChatAcpBridge {
 
     const drainQueue = sub === "all";
     const result = await this.sessionManager.cancelCurrent(userId, { drainQueue });
+    if (!this.isMessageGenerationCurrent(userId, generation)) return;
 
     trackEvent(
       "command.acp_cancel",
@@ -494,13 +679,24 @@ export class WeChatAcpBridge {
     await this.sendReply(userId, contextToken, this.formatAcpCancelResult(result, drainQueue));
   }
 
-  protected async handleAcpMoreCommand(userId: string, contextToken: string): Promise<void> {
+  protected async handleAcpMoreCommand(
+    userId: string,
+    contextToken: string,
+    generation: number,
+  ): Promise<void> {
+    const isCurrent = () =>
+      this.isMessageGenerationCurrent(userId, generation);
     return this.queueSendTask(userId, async () => {
+      if (!isCurrent()) return;
       const result = await drainPendingText(
         this.pendingText,
         userId,
-        (segment) => this.sendTextSegment(userId, contextToken, segment),
+        (segment) =>
+          isCurrent()
+            ? this.sendTextSegment(userId, contextToken, segment, isCurrent)
+            : Promise.resolve(false),
       );
+      if (!isCurrent()) return;
       trackEvent(
         "command.acp_more",
         {
@@ -512,8 +708,14 @@ export class WeChatAcpBridge {
         hashUserId(userId),
       );
       if (result.pendingCount === 0) {
-        await this.sendTextSegment(userId, contextToken, "No pending messages right now.");
+        await this.sendTextSegment(
+          userId,
+          contextToken,
+          "No pending messages right now.",
+          isCurrent,
+        );
       }
+      if (!isCurrent()) return;
       this.cancelTypingIndicator(userId, contextToken).catch(() => {});
     });
   }
@@ -558,17 +760,33 @@ export class WeChatAcpBridge {
     return this.extractBridgeCommand(msg, BUFFER_DONE_COMMAND) !== null;
   }
 
-  private handleBufferStart(userId: string, contextToken: string): void {
-    if (this.messageBuffers.has(userId)) {
-      const buffer = this.messageBuffers.get(userId)!;
+  private handleBufferStart(
+    userId: string,
+    contextToken: string,
+    generation: number,
+  ): void {
+    const existing = this.messageBuffers.get(userId);
+    if (existing?.generation === generation) {
+      const buffer = existing;
       this.sendReply(userId, contextToken, `📝 Already in buffering mode (${buffer.blocks.length} block(s) collected). Keep sending, then ${BUFFER_DONE_COMMAND}${this.aliasHint(BUFFER_DONE_COMMAND)} to submit.`).catch((err) => {
         this.log(`Failed to send buffer active notice to ${userId}: ${String(err)}`);
       });
       return;
     }
+    if (existing) {
+      this.messageBuffers.delete(userId);
+      this.clearBufferTimer(userId);
+    }
 
-    this.messageBuffers.set(userId, { blocks: [], contextToken, pending: Promise.resolve(), lastUpdatedAt: Date.now() });
-    this.resetBufferTimer(userId);
+    const buffer: MessageBuffer = {
+      blocks: [],
+      contextToken,
+      pending: Promise.resolve(),
+      lastUpdatedAt: Date.now(),
+      generation,
+    };
+    this.messageBuffers.set(userId, buffer);
+    this.resetBufferTimer(userId, buffer);
     this.log(`Buffer started for ${userId}`);
     trackEvent(
       "command.buffer_start",
@@ -580,9 +798,13 @@ export class WeChatAcpBridge {
     });
   }
 
-  private handleBufferDone(userId: string, contextToken: string): Promise<void> {
+  private handleBufferDone(
+    userId: string,
+    contextToken: string,
+    generation: number,
+  ): Promise<void> {
     const buffer = this.messageBuffers.get(userId);
-    if (!buffer) {
+    if (!buffer || buffer.generation !== generation) {
       return this.sendReply(userId, contextToken, `⚠️ Nothing buffered. Send ${BUFFER_START_COMMAND}${this.aliasHint(BUFFER_START_COMMAND)} first, then send messages before ${BUFFER_DONE_COMMAND}${this.aliasHint(BUFFER_DONE_COMMAND)}.`);
     }
 
@@ -596,33 +818,43 @@ export class WeChatAcpBridge {
 
     // Register a flushing promise so messages arriving during the await
     // queue behind the buffered prompt, preserving turn order.
-    const flushPromise = this.doFlush(userId, contextToken, buffer, pending);
+    const flushPromise = this.doFlush(
+      userId,
+      contextToken,
+      buffer,
+      pending,
+      () => this.isMessageGenerationCurrent(userId, generation),
+    );
     this.bufferFlushing.set(userId, flushPromise);
-    flushPromise.finally(() => {
+    void flushPromise.finally(() => {
       // Only clear if this is still our flush (not a newer one)
       if (this.bufferFlushing.get(userId) === flushPromise) {
         this.bufferFlushing.delete(userId);
       }
-    });
+    }).catch(() => {});
     return flushPromise;
   }
 
   private async doFlush(
     userId: string,
     contextToken: string,
-    buffer: { blocks: acp.ContentBlock[]; contextToken: string; pending: Promise<void>; lastUpdatedAt: number },
+    buffer: MessageBuffer,
     pending: Promise<void>,
+    isCurrent: () => boolean,
   ): Promise<void> {
     // Wait for any in-flight appends to finish before reading
     try {
       await pending;
     } catch {
+      if (!isCurrent()) return;
       // A prior append failed (e.g. image download error). The chain
       // already logged/tracked the error. Clear the buffer so the user
       // can start fresh.
       await this.sendReply(userId, contextToken, `⚠️ A buffered message failed to process. Buffer cleared. Please send ${BUFFER_START_COMMAND}${this.aliasHint(BUFFER_START_COMMAND)} to try again.`);
       return;
     }
+
+    if (!isCurrent()) return;
 
     // Check expiry
     if (Date.now() - buffer.lastUpdatedAt > BUFFER_TTL_MS) {
@@ -645,6 +877,7 @@ export class WeChatAcpBridge {
       hashUserId(userId),
     );
 
+    if (!isCurrent()) return;
     await this.enqueueBufferedPrompt(userId, contextToken, buffer.blocks);
   }
 
@@ -663,12 +896,15 @@ export class WeChatAcpBridge {
   ): void {
     const buffer = this.messageBuffers.get(userId);
     if (!buffer) return;
+    const isCurrentBuffer = () =>
+      this.messageBuffers.get(userId) === buffer &&
+      this.isMessageGenerationCurrent(userId, buffer.generation);
 
     // Chain the async conversion so /acp-prompt-done waits for all in-flight appends
     buffer.pending = buffer.pending
       .then(async () => {
         // Re-check buffer still exists (could have been flushed or expired)
-        if (!this.messageBuffers.has(userId)) return;
+        if (!isCurrentBuffer()) return;
 
         // Check TTL
         if (Date.now() - buffer.lastUpdatedAt > BUFFER_TTL_MS) {
@@ -690,12 +926,11 @@ export class WeChatAcpBridge {
           this.log,
           this.config.storage.inboxDir,
         );
+        if (!isCurrentBuffer()) return;
         buffer.blocks.push(...prompt);
         buffer.contextToken = contextToken;
         buffer.lastUpdatedAt = Date.now();
-        if (this.messageBuffers.has(userId)) {
-          this.resetBufferTimer(userId);
-        }
+        this.resetBufferTimer(userId, buffer);
 
         this.log(`Buffered message from ${userId}, now ${buffer.blocks.length} block(s)`);
       });
@@ -706,11 +941,11 @@ export class WeChatAcpBridge {
     });
   }
 
-  private resetBufferTimer(userId: string): void {
+  private resetBufferTimer(userId: string, expectedBuffer: MessageBuffer): void {
     this.clearBufferTimer(userId);
     this.bufferTimers.set(userId, setTimeout(() => {
       const buffer = this.messageBuffers.get(userId);
-      if (!buffer) return;
+      if (buffer !== expectedBuffer) return;
       this.messageBuffers.delete(userId);
       this.bufferTimers.delete(userId);
       this.log(`Buffer expired (timer) for ${userId}`);
@@ -747,7 +982,19 @@ export class WeChatAcpBridge {
     // that segments from separate sendReply calls cannot interleave (issue #38).
     // The stored link swallows errors so one failed reply doesn't break the
     // chain for the next caller, while the returned promise still propagates.
-    return this.queueSendTask(userId, () => this.deliverReply(userId, contextToken, text));
+    const generation = this.messageGenerations.get(userId) ?? 0;
+    const isCurrent = () =>
+      this.isMessageGenerationCurrent(userId, generation);
+    return this.queueSendTask(userId, () => {
+      if (!isCurrent()) return Promise.resolve();
+      return this.deliverReply(
+        userId,
+        contextToken,
+        text,
+        undefined,
+        isCurrent,
+      );
+    });
   }
 
   protected beginAgentPrompt(userId: string, contextToken: string): void {
@@ -760,9 +1007,30 @@ export class WeChatAcpBridge {
     text: string,
   ): Promise<void> {
     const generation = this.pendingText.generationForContext(userId, contextToken);
-    return this.queueSendTask(userId, () =>
-      this.deliverReply(userId, contextToken, text, generation),
+    return this.queueAgentSendTask(userId, (isCurrent) =>
+      this.deliverReply(
+        userId,
+        contextToken,
+        text,
+        generation,
+        isCurrent,
+      ),
     );
+  }
+
+  private queueAgentSendTask(
+    userId: string,
+    task: (isCurrent: () => boolean) => Promise<void>,
+  ): Promise<void> {
+    const generation = this.messageGenerations.get(userId) ?? 0;
+    const isCurrent = () =>
+      this.isMessageGenerationCurrent(userId, generation);
+    return this.queueSendTask(userId, () => {
+      if (!isCurrent()) {
+        return Promise.resolve();
+      }
+      return task(isCurrent);
+    });
   }
 
   private queueSendTask(userId: string, task: () => Promise<void>): Promise<void> {
@@ -777,6 +1045,7 @@ export class WeChatAcpBridge {
     contextToken: string,
     text: string,
     generation?: number,
+    isCurrent: () => boolean = () => true,
   ): Promise<void> {
     const segments = splitText(text, TEXT_CHUNK_LIMIT);
     const startedAt = Date.now();
@@ -784,7 +1053,15 @@ export class WeChatAcpBridge {
     const failedSegments: string[] = [];
 
     for (const segment of segments) {
-      if (await this.sendTextSegment(userId, contextToken, segment)) {
+      if (!isCurrent()) return;
+      const sent = await this.sendTextSegment(
+        userId,
+        contextToken,
+        segment,
+        isCurrent,
+      );
+      if (!isCurrent()) return;
+      if (sent) {
         segmentsSent++;
       } else {
         failedSegments.push(segment);
@@ -825,11 +1102,14 @@ export class WeChatAcpBridge {
     userId: string,
     contextToken: string,
     segment: string,
+    isCurrent: () => boolean = () => true,
   ): Promise<boolean> {
     const segmentClientId = `wechat-acp-${crypto.randomUUID()}`;
     for (let attempt = 1; attempt <= SEGMENT_SEND_MAX_ATTEMPTS; attempt++) {
+      if (!isCurrent()) return false;
       try {
         await this.paceConsecutiveSend(userId);
+        if (!isCurrent()) return false;
         await sendTextMessage(
           userId,
           segment,
@@ -842,6 +1122,7 @@ export class WeChatAcpBridge {
         );
         return true;
       } catch (err) {
+        if (!isCurrent()) return false;
         trackException(err, "reply.segment", hashUserId(userId));
         if (attempt < SEGMENT_SEND_MAX_ATTEMPTS) {
           await new Promise((r) => setTimeout(r, SEGMENT_SEND_RETRY_BASE_MS * attempt));
@@ -854,10 +1135,18 @@ export class WeChatAcpBridge {
   private async sendImageReply(userId: string, contextToken: string, image: AgentImage): Promise<void> {
     // Ride the same per-user chain as text replies so an image cannot
     // interleave with the segments of a concurrent text reply.
-    return this.queueSendTask(userId, () => this.deliverImage(userId, contextToken, image));
+    return this.queueAgentSendTask(userId, (isCurrent) =>
+      this.deliverImage(userId, contextToken, image, isCurrent),
+    );
   }
 
-  private async deliverImage(userId: string, contextToken: string, image: AgentImage): Promise<void> {
+  private async deliverImage(
+    userId: string,
+    contextToken: string,
+    image: AgentImage,
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    if (!isCurrent()) return;
     const buffer = Buffer.from(image.data, "base64");
     const startedAt = Date.now();
     // Stable idempotency key across attempts. Together with reusing the
@@ -875,12 +1164,16 @@ export class WeChatAcpBridge {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= SEGMENT_SEND_MAX_ATTEMPTS; attempt++) {
+      if (!isCurrent()) return;
       try {
         // Upload once; only re-run if a previous attempt failed before the
         // upload completed. A send-stage failure retries with the same media.
         media ??= await uploadImageMedia(userId, buffer, sendOpts);
+        if (!isCurrent()) return;
         await this.paceConsecutiveSend(userId);
+        if (!isCurrent()) return;
         await sendImageItem(userId, media, sendOpts, clientId);
+        if (!isCurrent()) return;
         trackEvent(
           "reply.image.sent",
           {
@@ -894,6 +1187,7 @@ export class WeChatAcpBridge {
         this.cancelTypingIndicator(userId, contextToken).catch(() => {});
         return;
       } catch (err) {
+        if (!isCurrent()) return;
         lastError = err;
         trackException(err, "reply.image", hashUserId(userId));
         if (attempt < SEGMENT_SEND_MAX_ATTEMPTS) {
@@ -936,8 +1230,14 @@ export class WeChatAcpBridge {
   ): Promise<void> {
     // Ride the same per-user chain as text and image replies so a file cannot
     // interleave with the segments of a concurrent reply.
-    return this.queueSendTask(userId, () =>
-      this.deliverFile(userId, contextToken, file, telemetryKind),
+    return this.queueAgentSendTask(userId, (isCurrent) =>
+      this.deliverFile(
+        userId,
+        contextToken,
+        file,
+        telemetryKind,
+        isCurrent,
+      ),
     );
   }
 
@@ -946,7 +1246,9 @@ export class WeChatAcpBridge {
     contextToken: string,
     file: AgentFile,
     telemetryKind: "audio" | "file",
+    isCurrent: () => boolean,
   ): Promise<void> {
+    if (!isCurrent()) return;
     const buffer = Buffer.from(file.data, "base64");
     const startedAt = Date.now();
     // Stable idempotency key and name across attempts, same contract as
@@ -963,12 +1265,16 @@ export class WeChatAcpBridge {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= SEGMENT_SEND_MAX_ATTEMPTS; attempt++) {
+      if (!isCurrent()) return;
       try {
         // Upload once; only re-run if a previous attempt failed before the
         // upload completed. A send-stage failure retries with the same media.
         media ??= await uploadFileMedia(userId, buffer, sendOpts);
+        if (!isCurrent()) return;
         await this.paceConsecutiveSend(userId);
+        if (!isCurrent()) return;
         await sendFileItem(userId, media, fileName, sendOpts, clientId);
+        if (!isCurrent()) return;
         trackEvent(
           `reply.${telemetryKind}.sent`,
           {
@@ -982,6 +1288,7 @@ export class WeChatAcpBridge {
         this.cancelTypingIndicator(userId, contextToken).catch(() => {});
         return;
       } catch (err) {
+        if (!isCurrent()) return;
         lastError = err;
         trackException(err, `reply.${telemetryKind}`, hashUserId(userId));
         if (attempt < SEGMENT_SEND_MAX_ATTEMPTS) {
@@ -1108,6 +1415,17 @@ export class WeChatAcpBridge {
 
   private extractAcpCancelCommand(msg: WeixinMessage): string | null {
     return this.extractBridgeCommand(msg, ACP_CANCEL_COMMAND);
+  }
+
+  private extractAcpNewCommand(msg: WeixinMessage): string | null {
+    return this.extractBridgeCommand(msg, ACP_NEW_COMMAND);
+  }
+
+  private isMessageGenerationCurrent(
+    userId: string,
+    generation: number,
+  ): boolean {
+    return (this.messageGenerations.get(userId) ?? 0) === generation;
   }
 
   private extractBridgeCommand(msg: WeixinMessage, canonical: string): string | null {
@@ -1302,4 +1620,17 @@ function sanitizeStateError(err: unknown): Error {
   sanitized.name = err instanceof Error ? err.name : "Error";
   sanitized.stack = undefined;
   return sanitized;
+}
+
+function describeError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (
+    typeof err === "object" &&
+    err !== null &&
+    "message" in err &&
+    typeof err.message === "string"
+  ) {
+    return err.message;
+  }
+  return String(err);
 }

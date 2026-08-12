@@ -51,10 +51,13 @@ test("concurrent session creation reserves maxConcurrentUsers capacity", async (
       session.processing = true;
       return session;
     });
-  const second = internal.getOrCreateSession("user-2", "context-2");
+  const second = assert.rejects(
+    internal.getOrCreateSession("user-2", "context-2"),
+    /Maximum concurrent sessions reached/,
+  );
 
   assert.equal((await first).userId, "user-1");
-  await assert.rejects(second, /Maximum concurrent sessions reached/);
+  await second;
   assert.deepEqual(createdUsers, ["user-1"]);
   await manager.stop();
 });

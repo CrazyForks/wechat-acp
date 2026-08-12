@@ -224,7 +224,8 @@ command to one or more custom aliases via the `commandAliases` config map:
 {
   "commandAliases": {
     "/acp-cancel": ["/cancel", "/取消", "取消"],
-    "/acp-config": ["/config", "/设置"]
+    "/acp-config": ["/config", "/设置"],
+    "/acp-new": ["/acp-clear", "/new"]
   }
 }
 ```
@@ -250,7 +251,7 @@ Two alias styles are supported:
 
 Notes:
 
-- Keys must be a known bridge command (`/acp-config`, `/acp-cancel`, `/acp-more`, `/acp-prompt-start`, or `/acp-prompt-done`).
+- Keys must be a known bridge command (`/acp-config`, `/acp-cancel`, `/acp-new`, `/acp-more`, `/acp-prompt-start`, or `/acp-prompt-done`).
 - An alias may not collide with a built-in command name or be mapped to
   more than one command. Invalid configs are rejected at startup.
 
@@ -286,6 +287,29 @@ message, so they are intercepted before the normal ACP enqueue path.
 
 This mitigation can only retain failures reported by iLink. If iLink returns
 success but silently drops a message, the bridge cannot detect or replay it.
+
+## Starting a fresh ACP session
+
+Interactive agent commands such as Copilot CLI's `/clear` cannot clear context
+when they are forwarded as normal ACP prompt text. Use the bridge command
+instead:
+
+```text
+/acp-new
+```
+
+The command stops the current user's active turn and agent subprocess, drops
+messages queued behind that turn, clears any multi-part prompt buffer, and
+removes the saved ACP session ID. The user's next normal message starts a new
+agent subprocess and `session/new` conversation with the same agent, working
+directory, environment, and bridge configuration.
+
+Reset is isolated to the requesting WeChat user. Other users and the bridge
+process keep running. It works with `session.resume` set to `off`, `auto`, or
+`required`, and it is handled by `wechat-acp` rather than forwarded to the
+underlying agent.
+
+Use `commandAliases` to add names such as `/acp-clear` or `/new`.
 
 ## WeChat ACP config command
 
