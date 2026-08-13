@@ -531,8 +531,7 @@ export class SessionManager {
       );
     }
     if (
-      this.reservedSessionCount() >=
-      this.opts.maxConcurrentUsers
+      !this.hasSessionCapacity(userId)
     ) {
       const eviction = this.evictOldest();
       if (eviction) {
@@ -549,8 +548,7 @@ export class SessionManager {
           },
           (err) => {
             if (
-              this.reservedSessionCount() >=
-              this.opts.maxConcurrentUsers
+              !this.hasSessionCapacity(userId)
             ) {
               throw err;
             }
@@ -567,8 +565,7 @@ export class SessionManager {
       }
     }
     if (
-      this.reservedSessionCount() >=
-      this.opts.maxConcurrentUsers
+      !this.hasSessionCapacity(userId)
     ) {
       return Promise.reject(
         new Error(
@@ -831,9 +828,15 @@ export class SessionManager {
       .map(([userId]) => userId);
     return new Set([
       ...this.sessions.keys(),
+      ...this.exitedSessions.keys(),
       ...this.pendingSessions.keys(),
       ...cleanupUsersWithLiveResources,
     ]).size;
+  }
+
+  private hasSessionCapacity(userId: string): boolean {
+    if (this.exitedSessions.has(userId)) return true;
+    return this.reservedSessionCount() < this.opts.maxConcurrentUsers;
   }
 
   private async createSession(
